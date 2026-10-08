@@ -1,0 +1,1722 @@
+"""
+[PARTNER-TIPS 2026-07-18] Partner tips bot orchestration (WS5).
+
+Owns the partner-facing jobs (wired in scheduler_setup.register_partner_
+scheduler_jobs) and the partner_messages dedup/throttle table:
+
+  - partner_scan_tick      cron */2min at :40s, 09:45-15:05  -> ORB signal tips
+  - partner_analytics_tick cron minute 2-57/5, 09:20-15:30   -> wide-chain
+        snapshot -> OI store -> PCR/IV/OI-wall/regime/halt/momentum events
+  - partner_morning_brief  09:50 -> per-underlying levels + options context
+  - partner_eod_wrap       15:40 -> day recap + signal outcomes + OI purge
+  - partner_rv_refresh     09:10 -> per-underlying 20d realized vol cache
+
+Scheduling is deliberately OFF the quarter-hour grid: the momentum
+screener and penny scans burst the shared Kite limiter at :00/:15/:30/:45
+and partner calls must never queue ahead of the trading path at those
+moments (plan: Performance isolation §1).
+
+Every job's FIRST check is partner_enabled(): disabled means an
+immediate return -- zero Kite calls, zero DB writes, zero log lines.
+
+`kite`, `is_trading_day`, `_fno_regime_str` etc. are resolved through
+`import main` on every call, the scheduler_setup convention the test
+suite's patch-by-name discipline depends on.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+from datetime import date, datetime, timedelta
+from typing import Dict, List, Optional
+
+import aiosqlite
+import math
+import pytz
+import structlog
+
+import fno_analytics
+import fno_oi_store
+import options_math
+from config import settings
+from fno_chain import RISK_FREE_RATE, take_chain_snapshot, years_to_expiry
+from fno_engine_mom import SESSION_OPEN_MIN
+from fno_models import FnoDirection
+from fno_signal_scan import UnderlyingScan, attach_entry_chain, observe_underlying, scan_underlying
+
+
+_background_capture_tasks: set[asyncio.Task] = set()
+from fno_underlyings import analytics_underlyings, get_instruments_for, load_underlying_names
+from macro_events import event_note_for
+from partner_bot import partner_enabled, send_partner
+from partner_content import (
+    format_eod,
+    format_event,
+    format_morning_brief,
+    format_signal_tip,
+)
+
+logger = structlog.get_logger()
+IST = pytz.timezone("Asia/Kolkata")
+
+
+def _closed_bar_observation(sig, now: datetime) -> tuple[Optional[datetime], Optional[float], str]:
+    """Return a usable public underlying observation from a closed 5-min bar.
+
+    It is intentionally independent of option-chain construction: an active
+    published card may need an invalidation/target update on a quiet entry
+    tick.  A malformed, future, stale, or non-positive bar is explicit rather
+    than silently converted into a current market condition.
+    """
+    if sig is None:
+        return None, None, "missing_signal"
+    try:
+        observed = IST.localize(datetime.strptime(sig.bar_ts, "%Y-%m-%d %H:%M:%S")) + timedelta(minutes=5)
+    except (TypeError, ValueError):
+        return None, None, "bar_timestamp_unusable"
+    price = getattr(sig, "close", None)
+    if isinstance(price, bool) or not isinstance(price, (int, float)) or not math.isfinite(price) or price <= 0:
+        return None, None, "bar_close_unusable"
+    age = (now - observed).total_seconds()
+    if age < 0:
+        return None, None, "bar_timestamp_in_future"
+    if age > settings.PARTNER_MANUAL_ADVISORY_MANAGEMENT_MAX_OBSERVATION_AGE_SEC:
+        return None, None, "bar_observation_stale"
+    return observed, float(price), "ok"
+
+# In-memory per-day state (reset implicitly by date checks / restarts;
+# everything that must survive a restart lives in partner_messages).
+_rv_cache: Dict[str, float] = {}
+_rv_as_of: Dict[str, date] = {}
+_last_iv_reported: Dict[str, float] = {}
+_last_walls_reported: Dict[str, tuple] = {}
+# [PARTNER-ENRICH 2026-07-19] last-reported wall-OI delta per
+# (underlying, strike, opt_type); re-report only on a further move of
+# PARTNER_WALL_DELTA_PCT. Restart cost: one possibly-repeated event.
+_last_wall_flow_reported: Dict[tuple, float] = {}
+_last_regime_reported: Optional[str] = None
+_halt_reported_on: Optional[str] = None
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS partner_messages (
+  sent_at   TEXT NOT NULL,
+  kind      TEXT NOT NULL,
+  dedup_key TEXT NOT NULL,
+  delivered INTEGER NOT NULL DEFAULT 0,
+  detail    TEXT,
+  PRIMARY KEY (kind, dedup_key)
+);
+"""
+
+# Partner dedup/analytics tables share cache.db with the trading path.  A
+# short default SQLite wait turns a harmless scan overlap into a dropped
+# notification; keep writes bounded but allow the normal writer burst to
+# drain.  ``timeout`` is connection-local, so every call site opts in.
+SQLITE_OPERATION_TIMEOUT_SEC = 30.0
+
+
+def _partner_db(db_path: str):
+    return aiosqlite.connect(db_path, timeout=SQLITE_OPERATION_TIMEOUT_SEC)
+
+
+async def init_partner_db(db_path: str) -> None:
+    async with _partner_db(db_path) as db:
+        await db.execute("PRAGMA journal_mode=WAL")
+        await db.execute("PRAGMA busy_timeout=30000")
+        await db.executescript(_SCHEMA)
+        await db.commit()
+
+
+# ---------------------------------------------------------------------------
+# dedup / throttle
+# ---------------------------------------------------------------------------
+
+async def _seen(db_path: str, kind: str, key: str) -> bool:
+    async with _partner_db(db_path) as db:
+        cur = await db.execute(
+            "SELECT 1 FROM partner_messages WHERE kind=? AND dedup_key=?",
+            (kind, key),
+        )
+        return await cur.fetchone() is not None
+
+
+async def _record(
+    db_path: str, kind: str, key: str, delivered: bool,
+    detail: Optional[dict] = None, now: Optional[datetime] = None,
+) -> None:
+    ts = (now or datetime.now(IST)).strftime("%Y-%m-%d %H:%M:%S")
+    async with _partner_db(db_path) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO partner_messages "
+            "(sent_at, kind, dedup_key, delivered, detail) VALUES (?,?,?,?,?)",
+            (ts, kind, key, 1 if delivered else 0,
+             json.dumps(detail) if detail else None),
+        )
+        await db.commit()
+
+
+async def _throttled(
+    db_path: str, kind: str, key: str, now: datetime,
+) -> bool:
+    """True when a (kind, key) message went out inside the gap window.
+    Event kinds re-use the same dedup_key (the underlying), so the row's
+    sent_at IS the last-send time."""
+    async with _partner_db(db_path) as db:
+        cur = await db.execute(
+            "SELECT sent_at FROM partner_messages WHERE kind=? AND dedup_key=?",
+            (kind, key),
+        )
+        row = await cur.fetchone()
+    if row is None:
+        return False
+    try:
+        last = datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S")
+    except (ValueError, TypeError):
+        return False
+    gap = timedelta(minutes=settings.PARTNER_EVENT_MIN_GAP_MIN)
+    return (now.replace(tzinfo=None) - last) < gap
+
+
+async def _send_event(
+    db_path: str, kind: str, name: str, detail: str, now: datetime,
+    throttle_key: Optional[str] = None, metrics: Optional[dict] = None,
+) -> str:
+    """Throttle key defaults to the underlying (one event of a kind per
+    underlying per gap). Pass throttle_key when a single kind can fire
+    more than once per tick per underlying (wall_flow: support AND
+    resistance) so the two don't collide on one shared row."""
+    if metrics is not None:
+        metrics["events_considered"] = metrics.get("events_considered", 0) + 1
+    if (
+        settings.PARTNER_MANUAL_ADVISORY_DELIVERY_ENABLED
+        or (
+            settings.PARTNER_HEDGE_ENABLED
+            and settings.PARTNER_HEDGE_SUPPRESS_ANALYTICS
+        )
+    ) and kind in {"pcr_shift", "iv_move", "oi_walls", "wall_flow", "pin"}:
+        if metrics is not None:
+            metrics["suppressed"] = metrics.get("suppressed", 0) + 1
+        return "suppressed"
+    key = throttle_key or name or kind
+    if await _throttled(db_path, kind, key, now):
+        if metrics is not None:
+            metrics["throttled"] = metrics.get("throttled", 0) + 1
+        return "throttled"
+    ok = await send_partner(format_event(kind, name, detail), kind=kind)
+    await _record(db_path, kind, key, ok, now=now)
+    if metrics is not None:
+        bucket = "sent" if ok else "send_failed"
+        metrics[bucket] = metrics.get(bucket, 0) + 1
+    return "sent" if ok else "send_failed"
+
+
+# ---------------------------------------------------------------------------
+# shared gates
+# ---------------------------------------------------------------------------
+
+async def _gates_open(now: datetime, lo_min: int, hi_min: int) -> bool:
+    """enabled -> session window -> trading day -> fresh-ish token.
+    Ordered cheapest-first; the enabled check is the zero-cost no-op."""
+    if not partner_enabled():
+        return False
+    nm = now.hour * 60 + now.minute
+    if not (lo_min <= nm <= hi_min):
+        return False
+    import main as _main
+    if not await _main.is_trading_day(now.date(), settings.DB_PATH):
+        return False
+    if not _main.kite.access_token:
+        return False
+    return True
+
+
+def _expiry_note_for(name: str, now: datetime, iv: Optional[float]) -> str:
+    book = get_instruments_for(name)
+    return fno_analytics.expiry_note(
+        book.nearest_option_expiry(now.date()), now.date(), iv
+    )
+
+
+def _dte_for(name: str, now: datetime) -> Optional[int]:
+    expiry = get_instruments_for(name).nearest_option_expiry(now.date())
+    return (expiry - now.date()).days if expiry is not None else None
+
+
+# ---------------------------------------------------------------------------
+# rolling track record ([PARTNER-ENRICH 2026-07-19] T1c)
+# ---------------------------------------------------------------------------
+
+async def _track_record(
+    db_path: str, name: str, direction: str, now: datetime,
+) -> str:
+    """One-line rolling record for (underlying, direction) from signal
+    rows whose EOD pass stamped an outcome. '' below the minimum sample
+    — a 3-signal 'record' is noise dressed as evidence, and today's
+    not-yet-resolved signals are naturally excluded (no outcome yet)."""
+    since = (
+        now - timedelta(days=settings.PARTNER_TRACK_LOOKBACK_DAYS)
+    ).strftime("%Y-%m-%d 00:00:00")
+    async with _partner_db(db_path) as db:
+        cur = await db.execute(
+            "SELECT detail FROM partner_messages "
+            "WHERE kind='signal' AND dedup_key LIKE ? AND sent_at>=?",
+            (f"{name}:%", since),
+        )
+        rows = await cur.fetchall()
+    n = hits = 0
+    r_sum = 0.0
+    for (detail_json,) in rows:
+        if not detail_json:
+            continue
+        try:
+            d = json.loads(detail_json)
+        except json.JSONDecodeError:
+            continue
+        if d.get("direction") != direction or d.get("outcome_kind") is None:
+            continue
+        r = d.get("outcome_r")
+        if not isinstance(r, (int, float)):
+            continue
+        n += 1
+        r_sum += float(r)
+        if d.get("outcome_kind") == "target":
+            hits += 1
+    if n < settings.PARTNER_TRACK_MIN_N:
+        return ""
+    return (
+        f"Record ({name} {direction}, {settings.PARTNER_TRACK_LOOKBACK_DAYS}d): "
+        f"{hits}/{n} target-first, avg {r_sum / n:+.1f}R on the underlying"
+    )
+
+
+# ---------------------------------------------------------------------------
+# job: signal scan tick (ORB tips)
+# ---------------------------------------------------------------------------
+
+async def partner_scan_tick(now: Optional[datetime] = None) -> None:
+    now = now or datetime.now(IST)
+    # New entry construction has its own 14:45 intraday deadline.  Keep this
+    # scheduler alive through the management deadline for exit reminders.
+    if not await _gates_open(now, 9 * 60 + 45, settings.PARTNER_MANUAL_ADVISORY_MANAGEMENT_END_MINUTE):
+        return
+    if settings.PARTNER_MANUAL_ADVISORY_DELIVERY_ENABLED or (
+        settings.PARTNER_HEDGE_ENABLED and settings.PARTNER_HEDGE_SUPPRESS_DIRECTIONAL
+    ):
+        return
+    import main as _main
+    logger.info("partner_scan_tick_invoked now_ist=%s", now.strftime("%H:%M:%S"))
+    regime = _main._fno_regime_str()
+    for spec in analytics_underlyings():
+        if not spec.signal_enabled:
+            continue
+        try:
+            scan = await scan_underlying(_main.kite, spec, regime, now)
+            sig = scan.sig
+            if sig is None or sig.direction is None:
+                continue
+            key = f"{spec.name}:{sig.bar_ts}"
+            if await _seen(settings.DB_PATH, "signal", key):
+                continue
+
+            option = None
+            if scan.pick is not None and scan.snap is not None:
+                q, iv, d = scan.pick
+                is_call = sig.direction == FnoDirection.LONG
+                T = years_to_expiry(scan.snap.expiry, now)
+                theta_day = options_math.theta(
+                    scan.snap.forward, q.contract.strike, T, iv,
+                    RISK_FREE_RATE, is_call,
+                )
+                option = {
+                    "tradingsymbol": q.contract.tradingsymbol,
+                    # A buyer pays the ask; quoting mid would flatter the fill.
+                    "premium": q.ask if q.ask > 0 else q.mid,
+                    "iv": iv,
+                    "delta": d,
+                    "theta_day": theta_day,
+                    "spread_pct": q.spread_pct if q.spread_pct != float("inf") else None,
+                    "oi": q.oi,
+                }
+                # [PARTNER-ENRICH 2026-07-19] T1a/T1d: premium-terms
+                # stop/target scenarios + lot-level sizing. Both degrade
+                # to absent lines rather than made-up numbers.
+                scen = fno_analytics.premium_scenarios(
+                    scan.snap.forward, q.contract.strike, T, iv, is_call,
+                    option["premium"], sig.stop_underlying, sig.target_underlying,
+                )
+                if scen is not None:
+                    option.update(
+                        prem_at_target=scen["at_target"],
+                        prem_at_stop=scen["at_stop"],
+                        rr_premium=scen["rr"],
+                    )
+                    lot = q.contract.lot_size
+                    risk_per_lot = (option["premium"] - scen["at_stop"]) * lot
+                    if lot > 0 and risk_per_lot > 0:
+                        budget = 100_000 * settings.PARTNER_SIZING_RISK_PCT
+                        option.update(
+                            lot_size=lot,
+                            risk_per_lot=risk_per_lot,
+                            lots_per_lakh=int(budget // risk_per_lot),
+                            sizing_risk_pct=settings.PARTNER_SIZING_RISK_PCT,
+                        )
+
+            broken = sig.or_high + settings.FNO_OR_BUFFER_ATR * sig.atr \
+                if sig.direction == FnoDirection.LONG \
+                else sig.or_low - settings.FNO_OR_BUFFER_ATR * sig.atr
+            or_atr_ratio = (
+                (sig.or_high - sig.or_low) / sig.atr if sig.atr > 0 else None
+            )
+            track_line = await _track_record(
+                settings.DB_PATH, spec.name, sig.direction.value, now,
+            )
+            msg = format_signal_tip(
+                name=spec.name,
+                direction=sig.direction.value,
+                bar_time=sig.bar_ts[11:16] if len(sig.bar_ts) >= 16 else sig.bar_ts,
+                close=sig.close,
+                broken_level=broken,
+                stop=sig.stop_underlying,
+                target=sig.target_underlying,
+                regime=regime,
+                rvol=sig.rvol,
+                expiry_note=_expiry_note_for(
+                    spec.name, now, option.get("iv") if option else None
+                ),
+                option=option,
+                thin_reasons=scan.thin_reasons if scan.thin_chain else None,
+                or_atr_ratio=or_atr_ratio,
+                track_line=track_line,
+            )
+            ok = await send_partner(msg, kind="signal")
+            detail = {
+                "direction": sig.direction.value,
+                "bar_ts": sig.bar_ts,
+                "close": sig.close,
+                "stop": sig.stop_underlying,
+                "target": sig.target_underlying,
+            }
+            if option and scan.pick is not None and scan.snap is not None:
+                # Enough to find this strike's LTP series in fno_chain_oi
+                # at EOD (T2b) without re-resolving instruments.
+                detail.update(
+                    tradingsymbol=option["tradingsymbol"],
+                    strike=scan.pick[0].contract.strike,
+                    opt_type="CE" if sig.direction == FnoDirection.LONG else "PE",
+                    expiry=scan.snap.expiry.isoformat(),
+                    premium_paid=option["premium"],
+                )
+            await _record(settings.DB_PATH, "signal", key, ok, detail=detail, now=now)
+        except Exception as exc:
+            logger.error(
+                "partner_scan_tick_failed underlying=%s err=%s",
+                spec.name, str(exc), exc_info=True,
+            )
+
+
+# ---------------------------------------------------------------------------
+# job: scoped manual-advisory preview tick (NIFTY/SENSEX only)
+# ---------------------------------------------------------------------------
+
+async def partner_manual_advisory_tick(now: Optional[datetime] = None, *, clock=None) -> None:
+    """Persist independently evaluated NIFTY/SENSEX advisory previews.
+
+    The pipeline is intentionally distinct from both the legacy signal sender
+    and the portfolio-required hedge service.  It never sends, places an
+    order, invents holdings, or uses Sentinel cash to size a partner idea.
+    """
+    if not (
+        settings.PARTNER_MANUAL_ADVISORY_ENABLED
+        or settings.PARTNER_MANUAL_ADVISORY_SHADOW_ENABLED
+    ):
+        return
+    from partner_decision_clock import aware, crossed_entry_boundary, sampled, start_clock
+    explicit_now = now is not None
+    now = aware(now or sampled(clock), "tick start")
+    def stage_now():
+        return now if explicit_now and clock is None else sampled(clock)
+    if not await _gates_open(now, settings.PARTNER_MANUAL_ADVISORY_ENTRY_START_MINUTE, settings.PARTNER_MANUAL_ADVISORY_MANAGEMENT_END_MINUTE):
+        return
+    import main as _main
+    from fno_underlyings import SPECS
+    from fno_chain import take_chain_snapshot
+    from dataclasses import replace
+    from partner_manual_advisory import (
+        AdvisoryScope, INDEX_EXCHANGES, StrategyEvidence, build_conditional_index_protective_put,
+        build_directional_debit_spread,
+        dispatch_queued_advisory, persist_candidate,
+        dispatch_queued_management_update, is_strategy_qualified, load_partner_profile_with_state,
+        queue_management_updates, record_advisory_input_status, resolve_advisory_expiry,
+        select_preferred_market_candidates, validate_candidate,
+    )
+
+    profile, profile_state = await load_partner_profile_with_state(settings.DB_PATH)
+    metrics = {"considered": 0, "validated_shadow": 0, "rejected": 0, "unavailable": 0,
+               "healthy_no_setup": 0, "management_observed": 0, "management_input_unavailable": 0}
+    regime = _main._fno_regime_str()
+    # The legacy signal-enabled flag was a temporary BFO rollout control.  It
+    # is not an excuse to silently omit SENSEX here: each index is evaluated
+    # independently and an unavailable BSE path is visible in this metric.
+    specs = [spec for spec in analytics_underlyings() if spec.name in INDEX_EXCHANGES]
+    seen = {spec.name for spec in specs}
+    specs.extend(SPECS[name] for name in INDEX_EXCHANGES if name not in seen)
+    market_candidates = []
+    protection_candidates = []
+    decision_clocks = {
+        spec.name: start_clock(underlying=spec.name,
+                               account_id=f"manual-profile:{profile.profile_id}",
+                               tick_started_at=now)
+        for spec in specs
+    }
+    attempt_store = None
+    if settings.RESEARCH_ARCHIVE_ENABLED:
+        try:
+            from partner_collection_attempts import PartnerCollectionAttemptStore
+            attempt_store = PartnerCollectionAttemptStore(settings.RESEARCH_ARCHIVE_PATH)
+            for item in decision_clocks.values():
+                await asyncio.to_thread(attempt_store.start, item, expected_at=now)
+        except Exception as exc:
+            attempt_store = None
+            logger.error("partner_collection_attempt_start_failed err=%s", str(exc), exc_info=True)
+
+    async def bounded_archive_write(function, *args, **kwargs):
+        """Bound advisory wait while retaining an explicit ambiguous outcome.
+
+        ``to_thread`` work cannot be force-cancelled safely. The archive's
+        nonblocking writer lease prevents an unbounded active-writer pileup;
+        the callback consumes the eventual result and logs its disposition.
+        """
+        task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+        _background_capture_tasks.add(task)
+        task.add_done_callback(_background_capture_tasks.discard)
+        try:
+            return await asyncio.wait_for(
+                asyncio.shield(task), timeout=settings.RESEARCH_CAPTURE_WAIT_TIMEOUT_SEC,
+            )
+        except asyncio.TimeoutError as exc:
+            def completed(late_task):
+                try:
+                    late_task.result()
+                    logger.warning("partner_research_capture_completed_after_timeout")
+                except Exception as late_exc:
+                    logger.error("partner_research_capture_failed_after_timeout err=%s", str(late_exc))
+            task.add_done_callback(completed)
+            raise TimeoutError("research capture wait timed out; final artifact state is unknown") from exc
+
+    async def record_public_attempt(spec_name, scan, capture) -> None:
+        if attempt_store is None:
+            return
+        state = "OBSERVED" if capture and capture.get("state") == "OBSERVED" else "UNAVAILABLE"
+        try:
+            await asyncio.to_thread(
+                attempt_store.record_public, decision_clocks[spec_name].run_id,
+                state=state, requested_at=getattr(scan, "public_requested_at", None),
+                received_at=getattr(scan, "public_received_at", None) or getattr(scan, "research_received_at", None),
+                observed_at=(public_facts.get(spec_name) or (None, None))[1],
+                source_id=getattr(scan, "public_source_id", None),
+                artifact_ref=(capture or {}).get("path"),
+                reason=(capture or {}).get("reason") or getattr(scan, "error", None),
+                updated_at=stage_now(),
+            )
+        except Exception as exc:
+            logger.error("partner_public_attempt_write_failed underlying=%s err=%s", spec_name, str(exc))
+
+    async def record_candidate_attempt(spec_name, scan, *, state, artifact=None, reason=None,
+                                       requested=(), received=()) -> None:
+        if attempt_store is None:
+            return
+        try:
+            await asyncio.to_thread(
+                attempt_store.record_candidate, decision_clocks[spec_name].run_id,
+                state=state, requested_at=getattr(scan, "chain_requested_at", None),
+                received_at=getattr(scan, "chain_received_at", None),
+                source_id=getattr(scan, "chain_source_id", None),
+                requested_contracts=requested, received_contracts=received,
+                artifact_ref=(artifact or {}).get("path"), reason=reason,
+                updated_at=stage_now(),
+            )
+        except Exception as exc:
+            logger.error("partner_candidate_attempt_write_failed underlying=%s err=%s", spec_name, str(exc))
+
+    async def finish_attempt(spec_name, state, reason) -> None:
+        if attempt_store is None:
+            return
+        try:
+            await asyncio.to_thread(attempt_store.finish, decision_clocks[spec_name].run_id,
+                                    state=state, reason=reason, updated_at=stage_now())
+        except Exception as exc:
+            logger.error("partner_attempt_finish_failed underlying=%s err=%s", spec_name, str(exc))
+
+    async def add_explicit_protection(spec, book, snapshot, decision_at=None) -> bool:
+        """Evaluate declared protection independently of directional entry."""
+        if not (profile.permits(AdvisoryScope.CONDITIONAL_PROTECTION, spec.name)
+                and profile.conditional_exposure_assumption and profile.conditional_coverage_units):
+            return False
+        decision_at = decision_at or now
+        protection = build_conditional_index_protective_put(
+            snapshot, book, decision_at, exposure_assumption=profile.conditional_exposure_assumption,
+            coverage_units=profile.conditional_coverage_units,
+            quote_ttl_seconds=settings.PARTNER_MANUAL_ADVISORY_QUOTE_TTL_SEC,
+            thesis_id=f"{spec.name}:PROTECTION:{snapshot.expiry}:{snapshot.taken_at.date()}",
+        )
+        if protection is None:
+            metrics["rejected"] += 1
+            return False
+        if await is_strategy_qualified(settings.DB_PATH, protection, profile_id=profile.profile_id, now=now):
+            protection = replace(protection, evidence=StrategyEvidence.QUALIFIED_FOR_ADVISORY)
+        precheck = validate_candidate(
+            protection, decision_at, max_quote_age_seconds=settings.PARTNER_MANUAL_ADVISORY_MAX_QUOTE_AGE_SEC,
+            max_spread_pct=settings.PARTNER_MANUAL_ADVISORY_MAX_SPREAD_PCT,
+            min_oi=settings.PARTNER_MANUAL_ADVISORY_MIN_OI,
+            min_volume=settings.PARTNER_MANUAL_ADVISORY_MIN_VOLUME,
+            min_depth_units=settings.PARTNER_MANUAL_ADVISORY_MIN_DEPTH_UNITS,
+        )
+        if precheck.valid:
+            protection_candidates.append(protection)
+        else:
+            metrics["rejected"] += 1
+        return precheck.valid
+    async def observe_one(spec):
+        """Contain an unexpected provider failure to its own underlying."""
+        try:
+            if explicit_now and clock is None:
+                return spec, await observe_underlying(_main.kite, spec, regime, now)
+            return spec, await observe_underlying(_main.kite, spec, regime, now, clock=stage_now)
+        except Exception as exc:
+            logger.error(
+                "partner_manual_advisory_public_observation_failed underlying=%s err=%s",
+                spec.name, str(exc), exc_info=True,
+            )
+            return spec, UnderlyingScan(name=spec.name, error=str(exc))
+
+    # Public observations are concurrent and are fully managed before any
+    # optional-chain I/O starts.  Consequently a stalled NIFTY entry chain
+    # cannot postpone SENSEX public observation, invalidation, or retirement.
+    public_facts = {}
+    management_errors = {}
+    for completed_observation in asyncio.as_completed(
+        [observe_one(spec) for spec in specs]
+    ):
+        spec, scan = await completed_observation
+        public_received = getattr(scan, "public_received_at", None) or getattr(scan, "research_received_at", None)
+        if public_received is not None:
+            decision_clocks[spec.name] = decision_clocks[spec.name].with_stage(
+                public_requested_at=getattr(scan, "public_requested_at", None) or now,
+                public_received_at=public_received,
+                public_source_id=getattr(scan, "public_source_id", None) or f"PUBLIC:{spec.name}",
+            )
+        observed_at, observed_underlying, observation_reason = _closed_bar_observation(scan.sig, now)
+        public_facts[spec.name] = (scan, observed_at, observed_underlying, observation_reason)
+        if observed_at is None or observed_underlying is None:
+            metrics["management_input_unavailable"] += 1
+            continue
+        try:
+            updates = await queue_management_updates(
+                settings.DB_PATH, underlying=spec.name,
+                observed_underlying=observed_underlying, observed_at=observed_at,
+            )
+            metrics["management_observed"] += 1
+            # Dispatch urgent lifecycle facts before optional entry I/O and
+            # before progressing to another index's optional-chain work.
+            for update in updates:
+                delivered = await dispatch_queued_management_update(settings.DB_PATH, update, now=now)
+                key = "update_delivered" if delivered else "update_queued"
+                metrics[key] = metrics.get(key, 0) + 1
+        except Exception as exc:
+            # Do not let one index's management DB/transport fault stop the
+            # other index's public lifecycle. Its own input status below keeps
+            # the failure visible and suppresses entry construction.
+            management_errors[spec.name] = exc
+            logger.error(
+                "partner_manual_advisory_management_failed underlying=%s err=%s",
+                spec.name, str(exc), exc_info=True,
+            )
+
+    # Capture only after BOTH urgent public-management paths have completed.
+    # Research disk I/O must not precede an invalidation dispatch.
+    if settings.RESEARCH_ARCHIVE_ENABLED:
+        from partner_research_capture import persist_public_input
+        for capture_spec in specs:
+            capture_scan = public_facts[capture_spec.name][0]
+            capture = None
+            capture_failure_reason = None
+            try:
+                capture = await bounded_archive_write(
+                    persist_public_input, settings.RESEARCH_ARCHIVE_PATH, capture_scan,
+                    regime=regime, evaluation_at=now,
+                    decision_clock=decision_clocks[capture_spec.name],
+                )
+                key = "research_input_observed" if capture["state"] == "OBSERVED" else "research_input_unavailable"
+                metrics[key] = metrics.get(key, 0) + 1
+            except TimeoutError as exc:
+                capture_failure_reason = "public_archive_outcome_unknown"
+                metrics["research_input_unavailable"] = metrics.get("research_input_unavailable", 0) + 1
+                logger.error("partner_research_input_capture_ambiguous underlying=%s err=%s", capture_spec.name, str(exc))
+            except Exception as exc:
+                capture_failure_reason = "public_archive_write_failed"
+                metrics["research_input_unavailable"] = metrics.get("research_input_unavailable", 0) + 1
+                logger.error("partner_research_input_capture_failed underlying=%s err=%s", capture_spec.name, str(exc))
+            if capture is None and capture_failure_reason:
+                capture = {"state": "UNAVAILABLE", "reason": capture_failure_reason}
+            await record_public_attempt(capture_spec.name, capture_scan, capture)
+
+    for spec in specs:
+        try:
+            scan, observed_at, observed_underlying, _observation_reason = public_facts[spec.name]
+            if spec.name in management_errors:
+                raise management_errors[spec.name]
+
+            if scan.error:
+                metrics["unavailable"] += 1
+                await record_advisory_input_status(
+                    settings.DB_PATH, underlying=spec.name, attempted_at=now,
+                    stage="INPUT_ERROR", reason=scan.error, entry_state="UNAVAILABLE",
+                    observed_at=observed_at, profile_state=profile_state,
+                    successful_observation=observed_at is not None,
+                )
+                await record_candidate_attempt(spec.name, scan, state="NOT_REQUIRED", reason="public_input_error")
+                await finish_attempt(spec.name, "UNAVAILABLE", "public_input_error")
+                continue
+            if scan.sig is None:
+                metrics["unavailable"] += 1
+                await record_advisory_input_status(
+                    settings.DB_PATH, underlying=spec.name, attempted_at=now,
+                    stage="MISSING_SIGNAL", reason="scan_returned_no_signal", entry_state="UNAVAILABLE",
+                    profile_state=profile_state,
+                )
+                await record_candidate_attempt(spec.name, scan, state="NOT_REQUIRED", reason="missing_signal")
+                await finish_attempt(spec.name, "UNAVAILABLE", "missing_signal")
+                continue
+
+            if scan.sig.direction is None:
+                # Protection requires an explicit profile assumption, never a
+                # fresh directional signal. Fetch a chain only for that
+                # opted-in branch; an unavailable chain is visible rather than
+                # silently treating protection as healthy/no-setup.
+                protection_attempted = False
+                protection_capture_ok = False
+                if (profile.permits(AdvisoryScope.CONDITIONAL_PROTECTION, spec.name)
+                        and profile.conditional_exposure_assumption and profile.conditional_coverage_units):
+                    protection_attempted = True
+                    book = get_instruments_for(spec.name)
+                    expiry = resolve_advisory_expiry(book, now.date())
+                    protection_requested_at = stage_now()
+                    protection_snapshot = await take_chain_snapshot(
+                        _main.kite, book, protection_requested_at, strike_window=settings.FNO_ANALYTICS_STRIKE_WINDOW,
+                        option_expiry=expiry,
+                    ) if expiry is not None else None
+                    protection_received_at = stage_now()
+                    scan.chain_requested_at = protection_requested_at
+                    scan.chain_received_at = protection_received_at
+                    scan.chain_source_id = f"KITE_OPTION_CHAIN:{spec.name}:CONDITIONAL_PROTECTION"
+                    decision_clocks[spec.name] = decision_clocks[spec.name].with_stage(
+                        chain_requested_at=protection_requested_at,
+                        chain_received_at=protection_received_at,
+                        chain_source_id=scan.chain_source_id,
+                        candidate_constructed_at=protection_received_at,
+                    )
+                    if protection_snapshot is None:
+                        metrics["unavailable"] += 1
+                        await record_advisory_input_status(
+                            settings.DB_PATH, underlying=spec.name, attempted_at=now,
+                            stage="PROTECTION_INPUT_UNAVAILABLE", reason="conditional_protection_chain_unavailable",
+                            entry_state="UNAVAILABLE", observed_at=observed_at, profile_state=profile_state,
+                            successful_observation=observed_at is not None,
+                        )
+                        await record_candidate_attempt(spec.name, scan, state="UNAVAILABLE",
+                                                       reason="conditional_protection_chain_unavailable")
+                        await finish_attempt(spec.name, "UNAVAILABLE", "protection_input_unavailable")
+                        continue
+                    else:
+                        boundary_reason = crossed_entry_boundary(
+                            decision_clocks[spec.name],
+                            entry_end_minute=settings.PARTNER_MANUAL_ADVISORY_ENTRY_END_MINUTE,
+                        )
+                        if boundary_reason:
+                            await record_candidate_attempt(spec.name, scan, state="UNAVAILABLE", reason=boundary_reason)
+                            await finish_attempt(spec.name, "SUPPRESSED", boundary_reason)
+                            continue
+                        protection_capture = {"state": "SKIPPED"} if not settings.RESEARCH_ARCHIVE_ENABLED else None
+                        if settings.RESEARCH_ARCHIVE_ENABLED:
+                            try:
+                                from partner_research_capture import persist_candidate_input
+                                protection_capture = await bounded_archive_write(
+                                    persist_candidate_input, settings.RESEARCH_ARCHIVE_PATH,
+                                    book=book, snapshot=protection_snapshot, profile=profile,
+                                    evaluation_at=now, received_at=protection_received_at,
+                                    decision_clock=decision_clocks[spec.name],
+                                )
+                            except Exception as exc:
+                                logger.error("partner_protection_capture_failed underlying=%s err=%s", spec.name, str(exc))
+                        protection_received = list(getattr(protection_snapshot, "received_tokens", ()))
+                        if not protection_received:
+                            protection_received = [quote.contract.token for quote in getattr(protection_snapshot, "quotes", {}).values()]
+                            if getattr(protection_snapshot, "fut_quote", None) is not None:
+                                protection_received.append(protection_snapshot.fut_quote.contract.token)
+                        protection_requested = list(getattr(protection_snapshot, "requested_tokens", ())) or protection_received
+                        await record_candidate_attempt(
+                            spec.name, scan,
+                            state=("ERROR" if not protection_capture else
+                                   "OBSERVED" if set(protection_requested) == set(protection_received) else "PARTIAL"),
+                            artifact=protection_capture,
+                            reason=("conditional_protection_archive_write_failed" if not protection_capture else
+                                    None if set(protection_requested) == set(protection_received) else "candidate_contracts_missing"),
+                            requested=protection_requested, received=protection_received,
+                        )
+                        await add_explicit_protection(
+                            spec, book, protection_snapshot,
+                            decision_at=decision_clocks[spec.name].candidate_constructed_at,
+                        )
+                        protection_capture_ok = bool(protection_capture) and set(protection_requested) == set(protection_received)
+                if observed_at is None or scan.sig.reject_reason in {
+                    "no_bars", "no_closed_bars_today", "opening_range_incomplete",
+                    "atr_unavailable", "ema_insufficient_bars", "rvol_baseline_unavailable",
+                }:
+                    metrics["unavailable"] += 1
+                    await record_advisory_input_status(
+                        settings.DB_PATH, underlying=spec.name, attempted_at=now,
+                        stage="SIGNAL_INPUT_UNAVAILABLE",
+                        reason=scan.sig.reject_reason or _observation_reason,
+                        entry_state="UNAVAILABLE", observed_at=observed_at,
+                        profile_state=profile_state,
+                    )
+                    await record_candidate_attempt(spec.name, scan, state="NOT_REQUIRED",
+                                                   reason=scan.sig.reject_reason or _observation_reason)
+                    await finish_attempt(spec.name, "UNAVAILABLE", "signal_input_unavailable")
+                    continue
+                metrics["healthy_no_setup"] += 1
+                await record_advisory_input_status(
+                    settings.DB_PATH, underlying=spec.name, attempted_at=now,
+                    stage="NO_ENTRY_SETUP", reason=scan.sig.reject_reason or "no_direction",
+                    entry_state="NO_ENTRY_SETUP", observed_at=observed_at,
+                    profile_state=profile_state, successful_observation=observed_at is not None,
+                )
+                if protection_attempted:
+                    await finish_attempt(
+                        spec.name, "CANDIDATE_RECORDED" if protection_capture_ok else "ERROR",
+                        "conditional_protection_recorded" if protection_capture_ok else "conditional_protection_archive_write_failed",
+                    )
+                else:
+                    await record_candidate_attempt(spec.name, scan, state="NOT_REQUIRED", reason="no_direction")
+                    await finish_attempt(spec.name, "NO_SETUP", scan.sig.reject_reason or "no_direction")
+                continue
+
+            if explicit_now and clock is None:
+                scan = await attach_entry_chain(_main.kite, scan, now)
+            else:
+                scan = await attach_entry_chain(_main.kite, scan, now, clock=stage_now)
+            if getattr(scan, "chain_received_at", None) is not None:
+                decision_clocks[spec.name] = decision_clocks[spec.name].with_stage(
+                    chain_requested_at=getattr(scan, "chain_requested_at", None) or decision_clocks[spec.name].public_received_at,
+                    chain_received_at=scan.chain_received_at,
+                    chain_source_id=getattr(scan, "chain_source_id", None) or f"CHAIN:{spec.name}",
+                )
+            book = get_instruments_for(spec.name)
+            advisory_expiry = resolve_advisory_expiry(book, now.date())
+            if advisory_expiry is None:
+                metrics["unavailable"] += 1
+                await record_advisory_input_status(
+                    settings.DB_PATH, underlying=spec.name, attempted_at=now,
+                    stage="EXPIRY_UNAVAILABLE", reason="no_intraday_advisory_expiry",
+                    entry_state="UNAVAILABLE", observed_at=observed_at, profile_state=profile_state,
+                    successful_observation=observed_at is not None,
+                )
+                await record_candidate_attempt(spec.name, scan, state="UNAVAILABLE", reason="expiry_unavailable")
+                await finish_attempt(spec.name, "UNAVAILABLE", "expiry_unavailable")
+                continue
+            snapshot = scan.snap
+            if snapshot is None:
+                metrics["unavailable"] += 1
+                await record_advisory_input_status(
+                    settings.DB_PATH, underlying=spec.name, attempted_at=now,
+                    stage="DIRECTION_WITHOUT_CHAIN", reason=scan.entry_error or "fired_direction_missing_chain_snapshot",
+                    entry_state="UNAVAILABLE", observed_at=observed_at, profile_state=profile_state,
+                    successful_observation=observed_at is not None,
+                )
+                await record_candidate_attempt(spec.name, scan, state="UNAVAILABLE",
+                                               reason=scan.entry_error or "chain_snapshot_missing")
+                await finish_attempt(spec.name, "UNAVAILABLE", "direction_without_chain")
+                continue
+            if snapshot.expiry != advisory_expiry:
+                replacement_requested_at = stage_now()
+                snapshot = await take_chain_snapshot(
+                    _main.kite, book, replacement_requested_at,
+                    strike_window=settings.FNO_ANALYTICS_STRIKE_WINDOW,
+                    option_expiry=advisory_expiry,
+                )
+                replacement_received_at = stage_now()
+                decision_clocks[spec.name] = decision_clocks[spec.name].with_stage(
+                    chain_requested_at=replacement_requested_at,
+                    chain_received_at=replacement_received_at,
+                    chain_source_id=f"KITE_OPTION_CHAIN:{spec.name}:ADVISORY_EXPIRY",
+                )
+                scan.chain_requested_at = replacement_requested_at
+                scan.chain_received_at = replacement_received_at
+                scan.chain_source_id = f"KITE_OPTION_CHAIN:{spec.name}:ADVISORY_EXPIRY"
+            if snapshot is None:
+                metrics["unavailable"] += 1
+                await record_advisory_input_status(
+                    settings.DB_PATH, underlying=spec.name, attempted_at=now,
+                    stage="CHAIN_UNAVAILABLE", reason="advisory_expiry_chain_unavailable",
+                    entry_state="UNAVAILABLE", observed_at=observed_at, profile_state=profile_state,
+                    successful_observation=observed_at is not None,
+                )
+                await record_candidate_attempt(spec.name, scan, state="UNAVAILABLE",
+                                               reason="advisory_expiry_chain_unavailable")
+                await finish_attempt(spec.name, "UNAVAILABLE", "chain_unavailable")
+                continue
+            await add_explicit_protection(spec, book, snapshot)
+            candidate_clock = decision_clocks[spec.name].with_stage(candidate_constructed_at=stage_now())
+            decision_clocks[spec.name] = candidate_clock
+            boundary_reason = crossed_entry_boundary(
+                candidate_clock, entry_end_minute=settings.PARTNER_MANUAL_ADVISORY_ENTRY_END_MINUTE,
+            )
+            if boundary_reason:
+                metrics["unavailable"] += 1
+                await record_candidate_attempt(spec.name, scan, state="UNAVAILABLE", reason=boundary_reason)
+                await finish_attempt(spec.name, "SUPPRESSED", boundary_reason)
+                await record_advisory_input_status(
+                    settings.DB_PATH, underlying=spec.name, attempted_at=now,
+                    stage="ACQUISITION_BOUNDARY_CROSSED", reason=boundary_reason,
+                    entry_state="UNAVAILABLE", observed_at=snapshot.taken_at,
+                    profile_state=profile_state, successful_observation=True,
+                )
+                continue
+            candidate = build_directional_debit_spread(
+                snapshot, book, scan.sig.direction, candidate_clock.candidate_constructed_at,
+                evidence=StrategyEvidence.RESEARCH_ONLY,
+                quote_ttl_seconds=settings.PARTNER_MANUAL_ADVISORY_QUOTE_TTL_SEC,
+                thesis_id=f"{spec.name}:{scan.sig.direction.value}:{scan.sig.bar_ts}",
+                trigger_level=(scan.sig.or_high + settings.FNO_OR_BUFFER_ATR * scan.sig.atr)
+                if scan.sig.direction.value == "LONG" else (scan.sig.or_low - settings.FNO_OR_BUFFER_ATR * scan.sig.atr),
+                invalidation_level=scan.sig.stop_underlying, target_level=scan.sig.target_underlying,
+            )
+            candidate_capture_ok = not settings.RESEARCH_ARCHIVE_ENABLED
+            if settings.RESEARCH_ARCHIVE_ENABLED:
+                from partner_research_capture import persist_candidate_input
+                capture_received_at = candidate_clock.chain_received_at or candidate_clock.candidate_constructed_at
+                candidate_capture = None
+                candidate_capture_reason = None
+                try:
+                    candidate_capture = await bounded_archive_write(persist_candidate_input, settings.RESEARCH_ARCHIVE_PATH,
+                        book=book, snapshot=snapshot, profile=profile,
+                        evaluation_at=now, received_at=capture_received_at,
+                        decision_clock=candidate_clock)
+                    candidate_capture_ok = True
+                    metrics["research_candidate_observed"] = metrics.get("research_candidate_observed", 0) + 1
+                except TimeoutError as exc:
+                    candidate_capture_reason = "candidate_archive_outcome_unknown"
+                    metrics["research_candidate_unavailable"] = metrics.get("research_candidate_unavailable", 0) + 1
+                    logger.error("partner_research_candidate_capture_ambiguous underlying=%s err=%s", spec.name, str(exc))
+                except Exception as exc:
+                    candidate_capture_reason = "candidate_archive_write_failed"
+                    metrics["research_candidate_unavailable"] = metrics.get("research_candidate_unavailable", 0) + 1
+                    logger.error("partner_research_candidate_capture_failed underlying=%s err=%s", spec.name, str(exc))
+                received_tokens = list(getattr(snapshot, "received_tokens", ()))
+                if not received_tokens:
+                    received_tokens = [quote.contract.token for quote in getattr(snapshot, "quotes", {}).values()]
+                    if getattr(snapshot, "fut_quote", None) is not None:
+                        received_tokens.append(snapshot.fut_quote.contract.token)
+                requested_tokens = list(getattr(snapshot, "requested_tokens", ())) or received_tokens
+                candidate_capture_ok = candidate_capture_ok and set(requested_tokens) == set(received_tokens)
+                await record_candidate_attempt(
+                    spec.name, scan,
+                    state=("ERROR" if not candidate_capture else
+                           "OBSERVED" if set(requested_tokens) == set(received_tokens) else "PARTIAL"),
+                    artifact=candidate_capture,
+                    reason=(candidate_capture_reason if not candidate_capture else
+                            None if set(requested_tokens) == set(received_tokens) else "candidate_contracts_missing"),
+                    requested=requested_tokens, received=received_tokens,
+                )
+            if candidate is None:
+                metrics["rejected"] += 1
+                await record_advisory_input_status(
+                    settings.DB_PATH, underlying=spec.name, attempted_at=now,
+                    stage="CANDIDATE_UNAVAILABLE", reason="debit_spread_construction_failed",
+                    entry_state="REJECTED", observed_at=snapshot.taken_at, profile_state=profile_state,
+                    successful_observation=True,
+                )
+                await finish_attempt(spec.name, "REJECTED", "candidate_construction_failed")
+                continue
+            qualified = await is_strategy_qualified(settings.DB_PATH, candidate, profile_id=profile.profile_id, now=now)
+            qualification_state = "QUALIFIED" if qualified else "MISSING_QUALIFICATION"
+            if qualified:
+                candidate = replace(candidate, evidence=StrategyEvidence.QUALIFIED_FOR_ADVISORY)
+            precheck = validate_candidate(
+                candidate, candidate_clock.candidate_constructed_at,
+                max_quote_age_seconds=settings.PARTNER_MANUAL_ADVISORY_MAX_QUOTE_AGE_SEC,
+                max_spread_pct=settings.PARTNER_MANUAL_ADVISORY_MAX_SPREAD_PCT,
+                min_oi=settings.PARTNER_MANUAL_ADVISORY_MIN_OI,
+                min_volume=settings.PARTNER_MANUAL_ADVISORY_MIN_VOLUME,
+                min_depth_units=settings.PARTNER_MANUAL_ADVISORY_MIN_DEPTH_UNITS,
+            )
+            if not precheck.valid:
+                metrics["rejected"] += 1
+                await record_advisory_input_status(
+                    settings.DB_PATH, underlying=spec.name, attempted_at=now,
+                    stage="VALIDATION_REJECTED", reason=",".join(precheck.reasons),
+                    entry_state="REJECTED", observed_at=snapshot.taken_at, profile_state=profile_state,
+                    qualification_state=qualification_state, successful_observation=True,
+                )
+                await finish_attempt(spec.name, "REJECTED", "candidate_validation_rejected")
+                continue
+            market_candidates.append(candidate)
+            await record_advisory_input_status(
+                settings.DB_PATH, underlying=spec.name, attempted_at=now,
+                stage="CANDIDATE_VALIDATED", reason="awaiting_profile_and_delivery_gates",
+                entry_state="CANDIDATE_VALIDATED", observed_at=snapshot.taken_at,
+                profile_state=profile_state, qualification_state=qualification_state,
+                successful_observation=True,
+            )
+            await finish_attempt(
+                spec.name, "CANDIDATE_RECORDED" if candidate_capture_ok else "ERROR",
+                "candidate_validated" if candidate_capture_ok else "candidate_archive_write_failed",
+            )
+        except Exception as exc:
+            metrics["unavailable"] += 1
+            logger.error("partner_manual_advisory_tick_failed underlying=%s err=%s", spec.name, str(exc), exc_info=True)
+            try:
+                await record_advisory_input_status(
+                    settings.DB_PATH, underlying=spec.name, attempted_at=now,
+                    stage="TICK_EXCEPTION", reason=type(exc).__name__, entry_state="UNAVAILABLE",
+                    profile_state=profile_state,
+                )
+            except Exception:
+                logger.error("partner_manual_advisory_input_status_write_failed underlying=%s", spec.name, exc_info=True)
+            await finish_attempt(spec.name, "ERROR", type(exc).__name__)
+    preferred, overlapping = select_preferred_market_candidates(market_candidates)
+    preferred.extend(protection_candidates)
+    metrics["overlap_suppressed"] = len(overlapping)
+    for candidate in preferred:
+        metrics["considered"] += 1
+        stored = await persist_candidate(
+            settings.DB_PATH, candidate, profile, now=now,
+            validation_options={
+                "max_quote_age_seconds": settings.PARTNER_MANUAL_ADVISORY_MAX_QUOTE_AGE_SEC,
+                "max_spread_pct": settings.PARTNER_MANUAL_ADVISORY_MAX_SPREAD_PCT,
+                "min_oi": settings.PARTNER_MANUAL_ADVISORY_MIN_OI,
+                "min_volume": settings.PARTNER_MANUAL_ADVISORY_MIN_VOLUME,
+                "min_depth_units": settings.PARTNER_MANUAL_ADVISORY_MIN_DEPTH_UNITS,
+            },
+            queue_for_delivery=bool(settings.PARTNER_MANUAL_ADVISORY_DELIVERY_ENABLED),
+        )
+        if stored["status"] == "QUEUED":
+            delivered = await dispatch_queued_advisory(settings.DB_PATH, stored, profile, now=now)
+            metrics["delivered" if delivered else "queued"] = metrics.get("delivered" if delivered else "queued", 0) + 1
+        elif stored["status"] == "VALIDATED_SHADOW":
+            metrics["validated_shadow"] += 1
+        else:
+            metrics["rejected"] += 1
+    logger.info(
+        "partner_manual_advisory_tick_summary", **metrics,
+        delivery_enabled=bool(settings.PARTNER_MANUAL_ADVISORY_DELIVERY_ENABLED),
+        can_place_orders=False,
+    )
+
+
+async def partner_manual_advisory_lifecycle_tick(now: Optional[datetime] = None) -> None:
+    """Clock-driven intraday reminder/retirement independent of entry scans."""
+    if not (settings.PARTNER_MANUAL_ADVISORY_ENABLED or settings.PARTNER_MANUAL_ADVISORY_SHADOW_ENABLED):
+        return
+    now = now or datetime.now(IST)
+    # Retirement is safe local bookkeeping even off-session. Transporting a
+    # reminder remains independently authorised by its durable update path.
+    from partner_manual_advisory import dispatch_queued_management_update, run_intraday_session_lifecycle
+    updates = await run_intraday_session_lifecycle(settings.DB_PATH, now=now)
+    for update in updates:
+        await dispatch_queued_management_update(settings.DB_PATH, update, now=now)
+
+
+# ---------------------------------------------------------------------------
+# job: analytics tick (wide chain -> OI store -> events)
+# ---------------------------------------------------------------------------
+
+async def partner_analytics_tick(now: Optional[datetime] = None) -> None:
+    global _last_regime_reported, _halt_reported_on
+    now = now or datetime.now(IST)
+    if not await _gates_open(now, 9 * 60 + 20, 15 * 60 + 30):
+        return
+    import main as _main
+    logger.info("partner_analytics_tick_invoked now_ist=%s", now.strftime("%H:%M:%S"))
+    day_iso = now.date().isoformat()
+    oi_events_open = (now.hour * 60 + now.minute) >= 10 * 60  # OI delayed early
+    metrics = {
+        "underlyings_seen": 0, "snapshots_persisted": 0,
+        "snapshot_errors": 0, "events_considered": 0, "suppressed": 0,
+        "throttled": 0, "sent": 0, "send_failed": 0,
+        "analytics_suppression_enabled": bool(
+            settings.PARTNER_MANUAL_ADVISORY_DELIVERY_ENABLED
+            or (settings.PARTNER_HEDGE_ENABLED and settings.PARTNER_HEDGE_SUPPRESS_ANALYTICS)
+        ),
+    }
+
+    for spec in analytics_underlyings():
+        metrics["underlyings_seen"] += 1
+        try:
+            book = get_instruments_for(spec.name)
+            if not book.ready(now.date()):
+                continue
+            snap = await take_chain_snapshot(
+                _main.kite, book, now,
+                strike_window=settings.FNO_ANALYTICS_STRIKE_WINDOW,
+            )
+            if snap is None:
+                continue
+            pcr = fno_analytics.compute_pcr(snap)
+            max_pain = fno_analytics.compute_max_pain(snap)
+            iv = fno_analytics.atm_iv(snap, now)
+            await fno_oi_store.persist_snapshot(
+                settings.DB_PATH, spec.name, snap, pcr, max_pain, iv,
+            )
+            metrics["snapshots_persisted"] += 1
+
+            # --- IV spike/crush vs last reported ------------------------
+            if iv is not None:
+                last_iv = _last_iv_reported.get(spec.name)
+                if last_iv is None:
+                    _last_iv_reported[spec.name] = iv
+                elif last_iv > 0 and abs(iv - last_iv) / last_iv >= settings.PARTNER_IV_MOVE_ALERT_PCT:
+                    word = "spiked" if iv > last_iv else "dropped"
+                    await _send_event(
+                        settings.DB_PATH, "iv_move", spec.name,
+                        f"ATM IV {word} {last_iv * 100:.1f}% -> {iv * 100:.1f}% — "
+                        + ("long premium just got pricier"
+                           if iv > last_iv else
+                           "premium crush; longs bleed even when right"),
+                        now,
+                        metrics=metrics,
+                    )
+                    _last_iv_reported[spec.name] = iv
+
+            if not oi_events_open:
+                continue
+
+            # --- PCR shift vs open (+ futures buildup color) -------------
+            open_row = await fno_oi_store.first_fut_row_today(
+                settings.DB_PATH, spec.name, day_iso,
+            )
+            if (
+                open_row is not None and pcr is not None
+                and open_row.get("pcr") is not None
+                and abs(pcr - open_row["pcr"]) >= settings.PARTNER_PCR_ALERT_DELTA
+            ):
+                buildup = ""
+                if snap.fut_quote and open_row.get("fut_ltp") and open_row.get("fut_oi"):
+                    label = fno_analytics.classify_buildup(
+                        snap.forward - open_row["fut_ltp"],
+                        (snap.fut_quote.oi or 0) - open_row["fut_oi"],
+                    )
+                    if label != "NEUTRAL":
+                        buildup = f" | futures: {label.replace('_', ' ').lower()}"
+                bias = (
+                    "put writing building — dip-support bias"
+                    if pcr > open_row["pcr"]
+                    else "call writing building — upside likely capped"
+                )
+                await _send_event(
+                    settings.DB_PATH, "pcr_shift", spec.name,
+                    f"PCR {open_row['pcr']:.2f} -> {pcr:.2f} since open — {bias}{buildup}",
+                    now,
+                    metrics=metrics,
+                )
+
+            # --- OI wall migration --------------------------------------
+            support, resistance = fno_analytics.oi_walls(snap)
+            prev_walls = _last_walls_reported.get(spec.name)
+            if support is not None and resistance is not None:
+                if prev_walls is None:
+                    _last_walls_reported[spec.name] = (support, resistance)
+                elif (support, resistance) != prev_walls:
+                    await _send_event(
+                        settings.DB_PATH, "oi_walls", spec.name,
+                        f"OI walls moved: support {prev_walls[0]:,.0f} -> {support:,.0f}"
+                        f" | resistance {prev_walls[1]:,.0f} -> {resistance:,.0f}",
+                        now,
+                        metrics=metrics,
+                    )
+                    _last_walls_reported[spec.name] = (support, resistance)
+
+            # --- wall build/unwind vs open baseline ---------------------
+            # [PARTNER-ENRICH 2026-07-19] T2a: a wall that ADDS OI while
+            # price approaches is being defended; one that unwinds is
+            # likely to break. Far more tradeable than "walls moved".
+            baseline = await fno_oi_store.open_baseline(
+                settings.DB_PATH, spec.name, day_iso,
+            )
+            if baseline:
+                deltas = fno_analytics.strike_oi_deltas(snap, baseline)
+                wall_reads = (
+                    (support, "PE", "Support",
+                     "put writers adding — dip-support being defended",
+                     "put writers bailing — support weakening"),
+                    (resistance, "CE", "Resistance",
+                     "call writers pressing — upside capped for now",
+                     "call writers covering — breakout risk above"),
+                )
+                for strike, ot, side, build_txt, unwind_txt in wall_reads:
+                    if strike is None:
+                        continue
+                    base_oi = baseline.get((strike, ot))
+                    delta = deltas.get((strike, ot))
+                    if not base_oi or delta is None:
+                        continue
+                    pct = delta / base_oi
+                    flow_key = (spec.name, strike, ot)
+                    last_pct = _last_wall_flow_reported.get(flow_key, 0.0)
+                    if (
+                        abs(pct) >= settings.PARTNER_WALL_DELTA_PCT
+                        and abs(pct - last_pct) >= settings.PARTNER_WALL_DELTA_PCT
+                    ):
+                        await _send_event(
+                            settings.DB_PATH, "wall_flow", spec.name,
+                            f"{side} {strike:,.0f} {ot} OI {pct:+.0%} vs open — "
+                            + (build_txt if pct > 0 else unwind_txt),
+                            now,
+                            # support (PE) and resistance (CE) throttle
+                            # independently -- both can move in one tick.
+                            throttle_key=f"{spec.name}:{ot}",
+                            metrics=metrics,
+                        )
+                        _last_wall_flow_reported[flow_key] = pct
+
+            # --- expiry-day pin note ------------------------------------
+            # [PARTNER-ENRICH 2026-07-19] T3a: once per expiry afternoon.
+            if (
+                not (settings.PARTNER_MANUAL_ADVISORY_DELIVERY_ENABLED or (
+                    settings.PARTNER_HEDGE_ENABLED and settings.PARTNER_HEDGE_SUPPRESS_ANALYTICS
+                ))
+                and
+                book.is_expiry_day(now.date())
+                and (now.hour * 60 + now.minute) >= 13 * 60 + 30
+                and max_pain is not None and snap.forward > 0
+            ):
+                pin_key = f"{spec.name}:{day_iso}"
+                if not await _seen(settings.DB_PATH, "pin", pin_key):
+                    dist = snap.forward - max_pain
+                    ok = await send_partner(
+                        format_event(
+                            "pin", spec.name,
+                            f"expiry pin watch: fut {snap.forward:,.0f} vs "
+                            f"max pain {max_pain:,.0f} ({dist:+,.0f} pts) — "
+                            "price often gravitates toward max pain into the "
+                            "close; chasing moves away from it is fighting "
+                            "the writers",
+                        ),
+                        kind="pin",
+                    )
+                    await _record(settings.DB_PATH, "pin", pin_key, ok, now=now)
+        except Exception as exc:
+            metrics["snapshot_errors"] += 1
+            logger.error(
+                "partner_analytics_tick_failed underlying=%s err=%s",
+                spec.name, str(exc), exc_info=True,
+            )
+
+    # --- regime transition (index-level, one per tick) -------------------
+    try:
+        regime = _main._fno_regime_str()
+        if _last_regime_reported is None:
+            _last_regime_reported = regime
+        elif regime != _last_regime_reported:
+            await _send_event(
+                settings.DB_PATH, "regime_change", "",
+                f"Market regime changed: {_last_regime_reported} -> {regime}"
+                + (" — our system stops taking new entries in CRISIS"
+                   if regime == "REGIME_3_CRISIS" else ""),
+                now,
+                metrics=metrics,
+            )
+            _last_regime_reported = regime
+    except Exception as exc:
+        logger.warning("partner_regime_event_failed err=%s", str(exc))
+
+    # --- risk-limit notice (informational) -------------------------------
+    # [HONEST-HALT 2026-07-26] This used to broadcast "Our system halted its own
+    # trading today", which was not true: check_circuit_breakers() is advisory
+    # only. main.py imports it and never calls it; every consumer is a reporting
+    # surface (this notice, /health, routes_ops, routes_portfolio,
+    # /nifty circuit). No entry path is gated by it, so nothing was halted.
+    #
+    # It went out to subscribers on 2026-07-23 and 07-24 on the strength of eight
+    # consecutive "losses" that were all phantom re-closes of two positions
+    # already exited on 07-20 -- the two real momentum closes before them were
+    # both profits. A caution flag is fair to send; a false claim about our own
+    # behaviour is not. Reword to what the signal actually means and keep the
+    # ledger honest upstream (see auto_square_momentum).
+    try:
+        async with _main.state_lock:
+            halted, reasons = await _main.check_circuit_breakers(settings.DB_PATH)
+        if halted and _halt_reported_on != day_iso:
+            _halt_reported_on = day_iso
+            await _send_event(
+                settings.DB_PATH, "halt", "",
+                "Our risk limits are flagging caution today ("
+                + "; ".join(reasons[:3])
+                + ") — position sizes are unchanged, but treat signals with extra care",
+                now,
+                metrics=metrics,
+            )
+    except Exception as exc:
+        logger.warning("partner_halt_event_failed err=%s", str(exc))
+
+    # --- momentum stock-option cues --------------------------------------
+    try:
+        if settings.PARTNER_MANUAL_ADVISORY_DELIVERY_ENABLED or (
+            settings.PARTNER_HEDGE_ENABLED and settings.PARTNER_HEDGE_SUPPRESS_DIRECTIONAL
+        ):
+            logger.info("partner_analytics_tick_summary", **metrics)
+            return
+        fno_names = load_underlying_names()
+        if fno_names:
+            for s in list(getattr(_main, "momentum_signals_today", [])):
+                ticker = getattr(s, "ticker", None)
+                if not ticker or ticker.upper() not in fno_names:
+                    continue
+                key = f"{ticker.upper()}:{day_iso}"
+                if await _seen(settings.DB_PATH, "mom_cue", key):
+                    continue
+                vol_ratio = getattr(s, "volume_ratio", 0.0) or 0.0
+                close = getattr(s, "close", 0.0) or 0.0
+                # [PARTNER-ENRICH 2026-07-19] T3b: the screener's own
+                # levels make the cue actionable instead of a headline.
+                stop_loss = getattr(s, "stop_loss", 0.0) or 0.0
+                target_1 = getattr(s, "target_1", 0.0) or 0.0
+                levels = ""
+                if stop_loss > 0 and target_1 > 0:
+                    levels = (
+                        f" (screener stop {stop_loss:,.1f} / "
+                        f"target {target_1:,.1f} on the stock)"
+                    )
+                ok = await send_partner(
+                    format_event(
+                        "mom_cue", ticker.upper(),
+                        f"our momentum screener fired at {close:,.1f} on "
+                        f"{vol_ratio:.1f}x volume{levels} — F&O-listed, "
+                        "stock options are a way to play it",
+                    ),
+                    kind="mom_cue",
+                )
+                await _record(settings.DB_PATH, "mom_cue", key, ok, now=now)
+    except Exception as exc:
+        logger.warning("partner_mom_cue_failed err=%s", str(exc))
+    logger.info("partner_analytics_tick_summary", **metrics)
+
+
+async def _log_non_momentum_open_positions(db_path: str, now: datetime) -> None:
+    """Report open non-momentum rows without changing broker or ledger state.
+
+    EDGE/PENNY rows intentionally have a separate lifecycle from the
+    momentum square-off.  Surfacing them at EOD makes an old paper row (such
+    as AKI in the 2026-09-03 audit) visible without silently closing a
+    position or manufacturing P&L.
+    """
+    try:
+        async with _partner_db(db_path) as db:
+            cur = await db.execute(
+                "SELECT ticker, source, product_type, entry_date, shares "
+                "FROM positions WHERE status='OPEN' "
+                "AND COALESCE(source, '') <> 'MOMENTUM' "
+                "ORDER BY entry_date"
+            )
+            rows = await cur.fetchall()
+        if rows:
+            logger.warning(
+                "non_momentum_positions_open_at_eod",
+                observed_at=now.strftime("%Y-%m-%d %H:%M:%S IST"),
+                count=len(rows),
+                positions=[
+                    {"ticker": row[0], "source": row[1],
+                     "product_type": row[2], "entry_date": row[3],
+                     "shares": row[4]}
+                    for row in rows
+                ],
+            )
+    except Exception as exc:
+        logger.warning("non_momentum_positions_audit_failed", err=str(exc))
+
+
+# ---------------------------------------------------------------------------
+# job: morning brief
+# ---------------------------------------------------------------------------
+
+async def partner_morning_brief(now: Optional[datetime] = None) -> None:
+    now = now or datetime.now(IST)
+    if not await _gates_open(now, 0, 24 * 60):
+        return
+    if settings.PARTNER_MANUAL_ADVISORY_DELIVERY_ENABLED or (
+        settings.PARTNER_HEDGE_ENABLED and settings.PARTNER_HEDGE_SUPPRESS_LEGACY_BRIEF
+    ):
+        return
+    import main as _main
+    day_iso = now.date().isoformat()
+    if await _seen(settings.DB_PATH, "brief", day_iso):
+        return
+    logger.info("partner_morning_brief_invoked now_ist=%s", now.strftime("%H:%M:%S"))
+    regime = _main._fno_regime_str()
+    score = None
+    try:
+        state = getattr(_main, "_last_regime_state", None)
+        if state is not None:
+            score = float(getattr(state, "regime_score", None))
+    except (TypeError, ValueError):
+        score = None
+
+    rows: List[Dict] = []
+    for spec in analytics_underlyings():
+        row: Dict = {"name": spec.name}
+        try:
+            book = get_instruments_for(spec.name)
+            if not book.ready(now.date()):
+                row["error"] = "instruments not ready"
+                rows.append(row)
+                continue
+            scan = await scan_underlying(_main.kite, spec, regime, now)
+            sig = scan.sig
+            if sig is not None and sig.or_high > 0:
+                row.update(
+                    or_high=sig.or_high, or_low=sig.or_low, atr=sig.atr,
+                    long_level=sig.or_high + settings.FNO_OR_BUFFER_ATR * sig.atr,
+                    short_level=sig.or_low - settings.FNO_OR_BUFFER_ATR * sig.atr,
+                    fut=sig.close,
+                    or_atr_ratio=(
+                        (sig.or_high - sig.or_low) / sig.atr
+                        if sig.atr > 0 else None
+                    ),
+                )
+            snap = await take_chain_snapshot(
+                _main.kite, book, now,
+                strike_window=settings.FNO_ANALYTICS_STRIKE_WINDOW,
+            )
+            if snap is not None:
+                pcr = fno_analytics.compute_pcr(snap)
+                max_pain = fno_analytics.compute_max_pain(snap)
+                iv = fno_analytics.atm_iv(snap, now)
+                support, resistance = fno_analytics.oi_walls(snap)
+                skew = fno_analytics.atm_iv_skew(snap, now)
+                await fno_oi_store.persist_snapshot(
+                    settings.DB_PATH, spec.name, snap, pcr, max_pain, iv,
+                )
+                rv = _rv_cache.get(spec.name)
+                row.update(
+                    fut=row.get("fut") or snap.forward,
+                    pcr=pcr, max_pain=max_pain, iv=iv, rv=rv,
+                    iv_read=fno_analytics.iv_rv_read(iv, rv),
+                    support=support, resistance=resistance,
+                    expiry_note=_expiry_note_for(spec.name, now, iv),
+                    dte=_dte_for(spec.name, now),
+                )
+                if skew is not None:
+                    row.update(skew_ce=skew[0], skew_pe=skew[1])
+            elif "fut" not in row:
+                row["error"] = scan.error or "no data"
+        except Exception as exc:
+            logger.error(
+                "partner_brief_underlying_failed name=%s err=%s",
+                spec.name, str(exc), exc_info=True,
+            )
+            row["error"] = "internal error"
+        rows.append(row)
+
+    msg = format_morning_brief(
+        f"{day_iso} {now.strftime('%H:%M')} IST", regime, score, rows,
+        events_note=event_note_for(now.date()),
+    )
+    ok = await send_partner(msg, kind="brief")
+    await _record(settings.DB_PATH, "brief", day_iso, ok, now=now)
+
+
+# ---------------------------------------------------------------------------
+# job: EOD wrap (+ retention purges)
+# ---------------------------------------------------------------------------
+
+def _signal_outcome(bars, detail: dict):
+    """Walk today's 5-min bars after the signal bar: which of target/stop
+    printed first? Purely informational -- our own exits (trail/time/flat)
+    are not modeled here; the partner saw stop+target in the tip.
+
+    Returns (text, kind, r): kind in target|stop|neither|None (None =
+    outcome unavailable), r = underlying-R vs the tip's risk (target hit
+    counts the actual target distance, stop -1.0, neither = close-to-
+    close move in R). kind/r feed the persisted track record (T1c)."""
+    try:
+        import pandas as pd  # noqa: F401  (bars is a DataFrame)
+        bar_ts = datetime.strptime(detail["bar_ts"], "%Y-%m-%d %H:%M:%S")
+        after = bars[bars.index > bar_ts]
+        long_view = detail["direction"] == "LONG"
+        entry = float(detail["close"])
+        stop, target = float(detail["stop"]), float(detail["target"])
+        risk = abs(entry - stop)
+        r_target = (abs(target - entry) / risk) if risk > 0 else 1.5
+        for _, b in after.iterrows():
+            hi, lo = float(b["high"]), float(b["low"])
+            if long_view:
+                if lo <= stop:
+                    return f"stop {stop:,.0f} hit first", "stop", -1.0
+                if hi >= target:
+                    return f"target {target:,.0f} hit", "target", r_target
+            else:
+                if hi >= stop:
+                    return f"stop {stop:,.0f} hit first", "stop", -1.0
+                if lo <= target:
+                    return f"target {target:,.0f} hit", "target", r_target
+        close = float(bars["close"].iloc[-1]) if len(bars) else 0.0
+        pts = (close - entry) * (1 if long_view else -1)
+        r = (pts / risk) if risk > 0 else 0.0
+        return (
+            f"neither printed; closed {close:,.0f} ({pts:+,.0f} pts)",
+            "neither", r,
+        )
+    except Exception:
+        return "outcome unavailable", None, None
+
+
+async def _stamp_outcome(
+    db_path: str, key: str, detail: dict, kind: str, r,
+) -> None:
+    """Write outcome fields back into the signal row's detail JSON so the
+    rolling track record (T1c) can read resolved signals later. UPDATE
+    keeps sent_at intact (it doubles as the retention timestamp)."""
+    detail = dict(detail)
+    detail["outcome_kind"] = kind
+    detail["outcome_r"] = round(float(r), 3) if r is not None else None
+    async with _partner_db(db_path) as db:
+        await db.execute(
+            "UPDATE partner_messages SET detail=? "
+            "WHERE kind='signal' AND dedup_key=?",
+            (json.dumps(detail), key),
+        )
+        await db.commit()
+
+
+async def _option_outcome_line(detail: dict, day_iso: str) -> str:
+    """[PARTNER-ENRICH 2026-07-19] T2b: what the SUGGESTED OPTION's
+    premium did after the tip, from the 5-min chain snapshots already in
+    fno_chain_oi. '' when the strike wasn't snapshotted (window moved)
+    or the tip carried no option."""
+    symbol = detail.get("tradingsymbol")
+    paid = detail.get("premium_paid")
+    strike = detail.get("strike")
+    opt_type = detail.get("opt_type")
+    expiry = detail.get("expiry")
+    if not (symbol and strike and opt_type and expiry) or not paid or paid <= 0:
+        return ""
+    series = await fno_oi_store.strike_ltp_series(
+        settings.DB_PATH, detail.get("underlying", ""), day_iso,
+        expiry, float(strike), opt_type,
+        from_ts=detail.get("bar_ts"),
+    )
+    if not series:
+        return ""
+    ltps = [ltp for _, ltp in series]
+    peak, last = max(ltps), ltps[-1]
+    return (
+        f"option {symbol}: paid ~{paid:,.1f}, "
+        f"peak {peak:,.1f} ({(peak - paid) / paid:+.0%}), "
+        f"last {last:,.1f} ({(last - paid) / paid:+.0%})"
+    )
+
+
+async def _track_record_overall(db_path: str, now: datetime) -> str:
+    """All-underlyings, all-directions rolling record for the EOD wrap."""
+    since = (
+        now - timedelta(days=settings.PARTNER_TRACK_LOOKBACK_DAYS)
+    ).strftime("%Y-%m-%d 00:00:00")
+    async with _partner_db(db_path) as db:
+        cur = await db.execute(
+            "SELECT detail FROM partner_messages "
+            "WHERE kind='signal' AND sent_at>=?",
+            (since,),
+        )
+        rows = await cur.fetchall()
+    n = hits = 0
+    r_sum = 0.0
+    for (detail_json,) in rows:
+        if not detail_json:
+            continue
+        try:
+            d = json.loads(detail_json)
+        except json.JSONDecodeError:
+            continue
+        if d.get("outcome_kind") is None:
+            continue
+        r = d.get("outcome_r")
+        if not isinstance(r, (int, float)):
+            continue
+        n += 1
+        r_sum += float(r)
+        if d.get("outcome_kind") == "target":
+            hits += 1
+    if n < settings.PARTNER_TRACK_MIN_N:
+        return ""
+    return (
+        f"📊 Rolling {settings.PARTNER_TRACK_LOOKBACK_DAYS}d ORB record: "
+        f"{hits}/{n} target-first, avg {r_sum / n:+.1f}R on the underlying"
+    )
+
+
+async def partner_eod_wrap(now: Optional[datetime] = None) -> None:
+    now = now or datetime.now(IST)
+    if not await _gates_open(now, 0, 24 * 60):
+        return
+    import main as _main
+    day_iso = now.date().isoformat()
+    if await _seen(settings.DB_PATH, "eod", day_iso):
+        return
+    logger.info("partner_eod_wrap_invoked now_ist=%s", now.strftime("%H:%M:%S"))
+    await _log_non_momentum_open_positions(settings.DB_PATH, now)
+
+    rows: List[Dict] = []
+    for spec in analytics_underlyings():
+        row: Dict = {"name": spec.name}
+        try:
+            book = get_instruments_for(spec.name)
+            fut = book.front_future(now.date()) if book.ready(now.date()) else None
+            if fut is None:
+                row["error"] = "instruments not ready"
+                rows.append(row)
+                continue
+            bars = await _main.kite.get_intraday_by_token(
+                fut.token, f"{day_iso} 09:15:00",
+                now.strftime("%Y-%m-%d %H:%M:%S"), interval="5minute",
+            )
+            if bars is None or bars.empty:
+                row["error"] = "no bars"
+                rows.append(row)
+                continue
+            or_end = SESSION_OPEN_MIN + settings.FNO_OR_MINUTES
+            or_bars = bars[[
+                SESSION_OPEN_MIN <= (t.hour * 60 + t.minute) < or_end
+                for t in bars.index
+            ]]
+            row.update(
+                day_high=float(bars["high"].max()),
+                day_low=float(bars["low"].min()),
+                close=float(bars["close"].iloc[-1]),
+                or_high=float(or_bars["high"].max()) if len(or_bars) else None,
+                or_low=float(or_bars["low"].min()) if len(or_bars) else None,
+            )
+
+            sig_rows: List[Dict] = []
+            async with _partner_db(settings.DB_PATH) as db:
+                cur = await db.execute(
+                    "SELECT dedup_key, detail FROM partner_messages "
+                    "WHERE kind='signal' AND dedup_key LIKE ? ORDER BY dedup_key",
+                    (f"{spec.name}:{day_iso}%",),
+                )
+                found = await cur.fetchall()
+            for _key, detail_json in found:
+                if not detail_json:
+                    continue
+                try:
+                    detail = json.loads(detail_json)
+                except json.JSONDecodeError:
+                    continue
+                outcome_txt, outcome_kind, outcome_r = _signal_outcome(bars, detail)
+                if outcome_kind is not None:
+                    await _stamp_outcome(
+                        settings.DB_PATH, _key, detail, outcome_kind, outcome_r,
+                    )
+                detail["underlying"] = spec.name
+                sig_rows.append({
+                    "time": detail.get("bar_ts", "")[11:16],
+                    "direction": detail.get("direction", "?"),
+                    "outcome": outcome_txt,
+                    "option_line": await _option_outcome_line(detail, day_iso),
+                })
+            row["signals"] = sig_rows
+
+            last = await fno_oi_store.latest_fut_row(settings.DB_PATH, spec.name)
+            if last is not None and last["snap_ts"].startswith(day_iso):
+                row.update(pcr=last["pcr"], max_pain=last["max_pain"])
+            if book.is_expiry_day(now.date() + timedelta(days=1)):
+                row["tomorrow_note"] = (
+                    f"{spec.name} expiry TOMORROW — theta burns fast, "
+                    "avoid holding long premium overnight"
+                )
+        except Exception as exc:
+            logger.error(
+                "partner_eod_underlying_failed name=%s err=%s",
+                spec.name, str(exc), exc_info=True,
+            )
+            row["error"] = "internal error"
+        rows.append(row)
+
+    if not (settings.PARTNER_MANUAL_ADVISORY_DELIVERY_ENABLED or (
+        settings.PARTNER_HEDGE_ENABLED and settings.PARTNER_HEDGE_SUPPRESS_LEGACY_EOD
+    )):
+        msg = format_eod(
+            day_iso, rows,
+            record_line=await _track_record_overall(settings.DB_PATH, now),
+        )
+        ok = await send_partner(msg, kind="eod")
+        await _record(settings.DB_PATH, "eod", day_iso, ok, now=now)
+
+    # Retention: OI snapshots + old dedup rows. Disk at 86% -- this is
+    # part of the job, not housekeeping that can silently stop running.
+    # [PARTNER-ENRICH 2026-07-19] signal rows live longer than the rest:
+    # the rolling track record (T1c) needs weeks, OI forensics needs days,
+    # and a few signal rows/day is negligible disk.
+    try:
+        await fno_oi_store.archive_then_purge_older_than(
+            settings.DB_PATH, settings.FNO_OI_RETENTION_DAYS,
+        )
+        cutoff = (
+            now - timedelta(days=settings.FNO_OI_RETENTION_DAYS)
+        ).strftime("%Y-%m-%d 00:00:00")
+        signal_cutoff = (
+            now - timedelta(days=settings.PARTNER_SIGNAL_RETENTION_DAYS)
+        ).strftime("%Y-%m-%d 00:00:00")
+        async with _partner_db(settings.DB_PATH) as db:
+            await db.execute(
+                "DELETE FROM partner_messages WHERE sent_at<? AND kind!='signal'",
+                (cutoff,),
+            )
+            await db.execute(
+                "DELETE FROM partner_messages WHERE sent_at<? AND kind='signal'",
+                (signal_cutoff,),
+            )
+            await db.commit()
+    except Exception as exc:
+        logger.warning("partner_purge_failed err=%s", str(exc))
+
+
+# ---------------------------------------------------------------------------
+# job: daily realized-vol refresh
+# ---------------------------------------------------------------------------
+
+RV_FETCH_CALENDAR_DAYS = 45   # >= 21 trading days of daily closes
+
+
+async def partner_rv_refresh(now: Optional[datetime] = None) -> None:
+    now = now or datetime.now(IST)
+    if not await _gates_open(now, 0, 24 * 60):
+        return
+    import main as _main
+    logger.info("partner_rv_refresh_invoked now_ist=%s", now.strftime("%H:%M:%S"))
+    for spec in analytics_underlyings():
+        try:
+            book = get_instruments_for(spec.name)
+            fut = book.front_future(now.date())
+            if fut is None:
+                continue
+            frm = (now - timedelta(days=RV_FETCH_CALENDAR_DAYS)).strftime("%Y-%m-%d")
+            # NOTE: futures dailies contaminate ~1 of 20 returns near the
+            # contract roll; acceptable for a rich/cheap read (plan WS3.3;
+            # index-token closes are the post-verification upgrade).
+            bars = await _main.kite.get_intraday_by_token(
+                fut.token, frm, now.strftime("%Y-%m-%d"), interval="day",
+            )
+            if bars is None or bars.empty or "close" not in bars:
+                continue
+            rv = fno_analytics.realized_vol_20d(bars["close"])
+            if rv is not None:
+                _rv_cache[spec.name] = rv
+                _rv_as_of[spec.name] = now.date()
+                logger.info(
+                    "partner_rv_refreshed underlying=%s rv=%.3f", spec.name, rv,
+                )
+        except Exception as exc:
+            logger.warning(
+                "partner_rv_refresh_failed underlying=%s err=%s",
+                spec.name, str(exc),
+            )

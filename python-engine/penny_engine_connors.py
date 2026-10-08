@@ -1,0 +1,322 @@
+"""
+[PENNY-CONNORS 2026-06-21] Larry Connors RSI(2) mean-reversion evaluator
+for the penny subsystem (CNC, multi-day).
+
+Spec section 4 + 4.5 covers the full signal + 3-way exit logic.
+
+Hard architectural rule (enforced by tests/test_penny_isolation.py):
+  this module MUST NOT import from engine, regime, risk_engine, portfolio,
+  evaluate_signal, or evaluate_momentum_signal.
+
+Public API:
+  evaluate_connors_entry(ticker, daily, today_volume, avg20_volume,
+                          regime_size_pct, risk_engine, as_of) -> dict
+  evaluate_connors_exit(pos, current_price, now) -> dict
+  atr_1min(bars) -> float
+"""
+import logging
+import math
+from datetime import datetime, timezone, timedelta
+from typing import List, Optional, Dict
+
+logger = logging.getLogger(__name__)
+
+
+# ---- helpers -----------------------------------------------------------
+
+def _sma(values: List[float], period: int) -> Optional[float]:
+    if len(values) < period:
+        return None
+    return sum(values[-period:]) / period
+
+
+def _rsi_2(closes: List[float]) -> float:
+    """
+    2-period RSI (Wilder-style). Requires >= 3 closes.
+    Returns 50.0 for insufficient data.
+
+    [FIX-PHASE1-AUDIT 2026-07-09] Implementation note: the 2-period average
+    uses only the last two gains/losses, so the full deltas history is not
+    needed. Pre-fix this function looped over every bar (O(N)) and the
+    scanner called it 3 times per evaluation (current, prev, prev-of-prev),
+    making it O(3N) per Connors gate evaluation. The micro-optimised version
+    below does the same math in O(1) w.r.t. length — only the last 2
+    deltas are examined.
+
+    Math equivalence is preserved bit-for-bit: given the same input, this
+    returns exactly the same float as the pre-fix implementation. The
+    closed-form below is just ``sum(gains[-2:]) / 2.0`` rewritten using
+    only the two most recent changes.
+    """
+    if closes is None or len(closes) < 3:
+        return 50.0
+    # Last two deltas only: change[-2] = closes[-2] - closes[-3],
+    # change[-1] = closes[-1] - closes[-2].
+    ch1 = closes[-2] - closes[-3]
+    ch2 = closes[-1] - closes[-2]
+    # Per the pre-fix loop: gain = max(ch, 0), loss = max(-ch, 0).
+    g1 = ch1 if ch1 > 0 else 0.0
+    l1 = -ch1 if ch1 < 0 else 0.0
+    g2 = ch2 if ch2 > 0 else 0.0
+    l2 = -ch2 if ch2 < 0 else 0.0
+    avg_g = (g1 + g2) / 2.0
+    avg_l = (l1 + l2) / 2.0
+    if avg_l == 0:
+        # Edge case: both deltas non-positive → all losses; pre-fix code
+        # returns 100 in this branch. If both deltas were exactly zero
+        # (flat closes) avg_l == 0; pre-fix returned 100 too, so the
+        # value-equivalence holds.
+        return 100.0
+    rs = avg_g / avg_l
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def atr_1min(bars: List[dict]) -> float:
+    """
+    Average true range of 1-min bars post-T1 (spec section 4.5).
+    True range per bar = high - low (1-min bars don't gap).
+    """
+    if bars is None or (hasattr(bars, "empty") and bars.empty):
+        return 0.0
+    if hasattr(bars, "columns"):
+        highs = bars["high"].tolist() if "high" in bars.columns else []
+        lows = bars["low"].tolist() if "low" in bars.columns else []
+        trs = [h - l for h, l in zip(highs, lows) if h is not None and l is not None]
+    else:
+        trs = [(b["high"] - b["low"]) for b in bars if b.get("high") is not None and b.get("low") is not None]
+    if not trs:
+        return 0.0
+    return sum(trs) / len(trs)
+
+
+# ---- entry evaluation --------------------------------------------------
+
+def evaluate_connors_entry(
+    ticker: str,
+    daily: dict,
+    today_volume: int,
+    avg20_volume: int,
+    regime_size_pct: float,
+    risk_engine,  # PennyRiskEngine instance (avoiding import cycle name)
+    as_of: datetime,
+) -> dict:
+    """
+    Returns one of:
+      {"accept": True, "entry": ..., "stop_loss": ..., "target_1": ...,
+       "target_2": ..., "shares": ..., "entry_order_type": "LIMIT",
+       "sl_order_type": "SL-M", "reason": "trigger fired"}
+      {"accept": False, "reject_reason": "<why>"}
+    """
+    from config import settings
+    # [PENNY-CONTRACT 2026-06-25] History floor is 250 daily bars
+    # (>= 200 SMA-200 + 50 buffer for SMA-50 + warm-up). This MUST stay
+    # >= scanner._evaluate_ticker_connors' 250-bar check
+    # (penny_scanner.py) -- otherwise the engine's stricter threshold
+    # never fires and the scanner's check is the de-facto contract.
+    # Renamed to PENNY_CONNORS_MIN_HISTORY_BARS for clarity; old literal
+    # 210 preserved as a back-compat comment.
+    HISTORY_FLOOR = 250  # was 210 pre-2026-06-25 (see G4 audit note)
+    closes = daily.get("closes", [])
+    if len(closes) < HISTORY_FLOOR:
+        return {"accept": False, "reject_reason": f"insufficient history (<{HISTORY_FLOOR} bars)"}
+
+    last = closes[-1]
+    sma_200 = _sma(closes, 200)
+    sma_50 = _sma(closes, 50)
+    if sma_200 is None or sma_50 is None:
+        return {"accept": False, "reject_reason": "SMA not available"}
+
+    # 1. Trend filter (spec section 4.2)
+    if last <= sma_200:
+        return {"accept": False, "reject_reason": "below 200 SMA (trend fail)"}
+    if last <= sma_50:
+        return {"accept": False, "reject_reason": "below 50 SMA (trend fail)"}
+
+    # 2. Trigger: RSI(2) < threshold (relaxed to 10 for penny, spec section 4.2)
+    rsi = _rsi_2(closes)
+    if rsi >= settings.PENNY_CONNORS_RSI2_BUY:
+        # [WATCHDOG-LABEL 2026-07-17] Stable text FIRST, number in a
+        # trailing parenthesis: the accept-watchdog histograms on the
+        # reason PREFIX, and the old "RSI(2)={value} ..." format collapsed
+        # to the bucket "RSI(2)=" -- which rendered in the Telegram alarm
+        # as an apparently-empty value (26.5% of CNC rejects on
+        # 2026-07-17 showed as `RSI(2)=`). It also merged this gate with
+        # the dead-cat floor gate below into one bucket.
+        return {"accept": False,
+                "reject_reason": f"RSI(2) not below buy threshold (rsi={rsi:.1f})"}
+
+    # 2a. [TIER2-CONNORS-REFINEMENT 2026-06-25] Absolute RSI(2) floor.
+    # The original Connors spec implies the trigger is "RSI(2) under 10"
+    # but never specified a *minimum* below which the signal is rejected.
+    # In practice, an RSI(2) of 0 means the stock closed down 3 days in
+    # a row with very small moves -- a true dead-cat bounce candidate.
+    # Default PENNY_CONNORS_RSI2_FLOOR=1.0 disables this gate; raising
+    # to 5.0 (post-A/B validation) cuts the worst 10-15% of these
+    # false-mean-reversion triggers per the published literature.
+    rsi_floor = settings.PENNY_CONNORS_RSI2_FLOOR
+    if rsi_floor > 1.0 and rsi < rsi_floor:
+        return {"accept": False,
+                "reject_reason": (
+                    f"RSI(2) below dead-cat floor (rsi={rsi:.1f} "
+                    f"floor={rsi_floor:.1f})"
+                )}
+
+    # 2b. [TIER2-CONNORS-REFINEMENT 2026-06-25] Cumulative RSI trigger.
+    # Count how many consecutive daily bars (including today) had
+    # RSI(2) below the buy threshold. Default 1 disables; raising to 2
+    # (per Connors' published refinement) cuts false-mean-reversion
+    # triggers significantly. The implementation is O(N) over closes;
+    # closes is the 250-day daily history, so this is cheap.
+    cum_days_required = settings.PENNY_CONNORS_CUMULATIVE_RSI_DAYS
+    if cum_days_required > 1:
+        cum_count = 0
+        # Walk back from latest, recomputing RSI(2) at each prefix.
+        # We use the same _rsi_2 helper; cost is negligible vs the
+        # network round-trip we already did for the daily bars.
+        for k in range(len(closes)):
+            prefix = closes[: len(closes) - k]
+            if len(prefix) < 3:
+                break
+            rsi_k = _rsi_2(prefix)
+            if rsi_k < settings.PENNY_CONNORS_RSI2_BUY:
+                cum_count += 1
+            else:
+                break  # streak broken
+        if cum_count < cum_days_required:
+            return {
+                "accept": False,
+                "reject_reason": (
+                    f"cumulative RSI(2) < threshold for only {cum_count} "
+                    f"day(s), need {cum_days_required}"
+                ),
+            }
+
+    # 3. Confirmation: RSI(2) rising for 2 consecutive bars (spec section 4.2)
+    rsi_prev1 = _rsi_2(closes[:-1])
+    rsi_prev2 = _rsi_2(closes[:-2])
+    if not (rsi > rsi_prev1 > rsi_prev2):
+        return {"accept": False, "reject_reason": "RSI not rising for 2 bars (falling knife)"}
+
+    # 4. Volume sanity (spec section 4.2)
+    if avg20_volume <= 0 or today_volume < 0.5 * avg20_volume:
+        return {"accept": False, "reject_reason": "volume too low (dead stock)"}
+
+    # ---- signal fires ----
+    # Entry at LTP + 0.5%, stop at -3%, T1 at +3%, T2 at +6%
+    entry = round(last * 1.005, 2)
+    stop_loss = round(entry * (1 - settings.PENNY_CONNORS_STOP_PCT), 2)
+    target_1 = round(entry * (1 + settings.PENNY_CONNORS_T1_PCT), 2)
+    target_2 = round(entry * (1 + settings.PENNY_CONNORS_T2_PCT), 2)
+
+    shares = risk_engine.position_size(entry, stop_loss, _regime_from_pct(regime_size_pct))
+    if shares <= 0:
+        return {"accept": False, "reject_reason": "position size = 0 (regime/cap blocked)"}
+
+    return {
+        "accept": True,
+        "ticker": ticker,
+        "entry": entry,
+        "stop_loss": stop_loss,
+        "target_1": target_1,
+        "target_2": target_2,
+        "shares": shares,
+        "entry_order_type": "LIMIT",
+        "sl_order_type": "SL-M",
+        "rsi_2": round(rsi, 2),
+        "signal_time": as_of,
+        "reason": "connors trigger fired",
+    }
+
+
+def _regime_from_pct(pct: float):
+    """Reverse-map size_pct to PennyRegime for risk sizing."""
+    from penny_models import PennyRegime
+    from config import settings
+    if pct >= settings.PENNY_RISK_PCT_PR1:
+        return PennyRegime.PR1_CALM
+    if pct >= settings.PENNY_RISK_PCT_PR2:
+        return PennyRegime.PR2_ELEVATED
+    return PennyRegime.PR3_HOT
+
+
+# ---- exit evaluation ---------------------------------------------------
+
+def evaluate_connors_exit(pos: dict, current_price: float, now: datetime) -> dict:
+    """
+    Spec section 4.2 + 4.5: 3-way exit (T2 OR trail OR time-stop, whichever first).
+    pos keys: entry_price, entry_time, t1_fired, t1_exit_price,
+              remaining_shares, highest_close_since_t1, atr_1min_post_t1
+
+    Time-stop is 3 *trading days* (weekday-counted) from entry, not 3 calendar
+    days -- a Friday entry is force-exited the following Wednesday, not Monday.
+    NSE holiday calendar is out of scope for v1; if a known holiday falls
+    inside the window the position holds one extra day (acceptable: the
+    broker-level SL-M still protects downside, this only delays exit by 1d).
+
+    Returns dict with:
+      {"exit_reason": "T2"|"trail_stop"|"time_stop"|"hold", "exit_price": float}
+    """
+    from config import settings
+    if not pos.get("t1_fired"):
+        # Pre-T1: only stop-loss applies (broker SL-M). Engine doesn't compute it here.
+        return {"exit_reason": "hold", "exit_price": current_price}
+
+    # 1. Time-stop: count weekdays (Mon-Fri) elapsed from entry to now.
+    if _trading_days_elapsed(pos["entry_time"], now) >= settings.PENNY_CONNORS_MAX_HOLD_DAYS:
+        return {"exit_reason": "time_stop", "exit_price": current_price}
+
+    # 2. T2 target
+    target_2 = pos["entry_price"] * (1 + settings.PENNY_CONNORS_T2_PCT)
+    if current_price >= target_2:
+        return {"exit_reason": "T2", "exit_price": target_2}
+
+    # 3. Trailing stop (post-T1, 2x ATR_1min, breakeven+0.5% floor)
+    floor = round(pos["entry_price"] * 1.005, 2)  # breakeven + 0.5%
+    atr = pos.get("atr_1min_post_t1", 0.0) or 0.0
+    trail_raw = pos.get("highest_close_since_t1", current_price) - \
+                 settings.PENNY_CONNORS_TRAIL_ATR_MULT * atr
+    trail = max(floor, trail_raw)
+    if current_price <= trail:
+        return {"exit_reason": "trail_stop", "exit_price": trail}
+
+    return {"exit_reason": "hold", "exit_price": current_price}
+
+
+def _trading_days_elapsed(start: datetime, end: datetime) -> int:
+    """
+    Count trading days (Mon-Fri minus NSE holidays) strictly between
+    start (exclusive) and end (inclusive). A Friday 09:30 -> following
+    Monday 09:30 = 1 trading day. Friday 09:30 -> Wednesday 09:30 = 3
+    trading days (force-exit fires).
+
+    [PENNY-G6 2026-06-25] Was a hardcoded weekday-only check (Mon-Fri)
+    which ignored NSE holidays. The original comment acknowledged this
+    limitation and said broker-level SL-M still protects downside. The
+    fix is to use market_calendar.is_trading_day_sync which reads the
+    local holiday cache (populated by the async holiday fetcher at
+    scheduler startup). If the cache is empty (no fetch has run yet),
+    falls back to weekday-only -- same behaviour as before, no
+    regression. When the cache IS populated, holiday-aware counting
+    fires correctly.
+    """
+    if end <= start:
+        return 0
+    from config import settings
+    db_path = settings.DB_PATH
+    try:
+        from market_calendar import trading_days_between_sync
+        return trading_days_between_sync(start.date(), end.date(), db_path)
+    except Exception as e:
+        logger.warning(
+            "penny_trading_days_calendar_unavailable error=%s falling_back_to_weekday",
+            str(e),
+        )
+        # Fallback to old hardcoded weekday check (preserves pre-fix behaviour).
+        days = 0
+        d = start.date() + timedelta(days=1)
+        end_date = end.date()
+        while d <= end_date:
+            if d.weekday() < 5:
+                days += 1
+            d += timedelta(days=1)
+        return days

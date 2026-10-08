@@ -1,0 +1,117 @@
+jest.mock('../../config', () => ({
+  INTERNAL_API_SECRET: 'internal-test-secret',
+  PYTHON_ENGINE_URL: 'http://python-engine:8000',
+  PYTHON_ENGINE_TIMEOUT_MS: 5000,
+}));
+jest.mock('../../middleware/logger', () => ({
+  logger: { error: jest.fn(), info: jest.fn(), warn: jest.fn() },
+}));
+
+const express = require('express');
+const request = require('supertest');
+
+global.fetch = jest.fn();
+const router = require('../../routes/proxy');
+
+function makeApp(authenticated = true) {
+  const app = express();
+  app.use((req, _res, next) => { req.session = { authenticated }; next(); });
+  app.use('/api/proxy', router);
+  return app;
+}
+
+beforeEach(() => jest.clearAllMocks());
+
+test('experiment proxy routes require a session', async () => {
+  const response = await request(makeApp(false)).get('/api/proxy/experiments/momentum');
+  expect(response.status).toBe(401);
+  expect(global.fetch).not.toHaveBeenCalled();
+});
+
+test.each([
+  ['momentum', '/experiments/momentum'],
+  ['penny', '/experiments/penny'],
+  ['fno-opening-range', '/experiments/fno-opening-range'],
+])('proxies authenticated %s experiment evidence', async (route, enginePath) => {
+  const payload = { enabled: true, status: 'empty', registry: {}, comparison: { variants: [] } };
+  global.fetch.mockResolvedValue({ status: 200, json: async () => payload });
+  const response = await request(makeApp()).get(`/api/proxy/experiments/${route}`);
+  expect(response.status).toBe(200);
+  expect(response.body).toEqual(payload);
+  expect(global.fetch).toHaveBeenCalledWith(
+    `http://python-engine:8000${enginePath}`,
+    expect.objectContaining({
+      method: 'GET',
+      headers: expect.objectContaining({ 'X-Internal-Secret': 'internal-test-secret' }),
+    }),
+  );
+});
+
+test('promotion readiness proxy requires a session', async () => {
+  const response = await request(makeApp(false)).get('/api/proxy/research/promotion-readiness');
+  expect(response.status).toBe(401);
+  expect(global.fetch).not.toHaveBeenCalled();
+});
+
+test('forwards authenticated promotion readiness with the internal secret', async () => {
+  const payload = {
+    research_only: true, can_place_orders: false, authorization_effect: 'NONE', families: [],
+  };
+  global.fetch.mockResolvedValue({ status: 200, json: async () => payload });
+  const response = await request(makeApp()).get('/api/proxy/research/promotion-readiness');
+  expect(response.status).toBe(200);
+  expect(response.body).toEqual(payload);
+  expect(global.fetch).toHaveBeenCalledWith(
+    'http://python-engine:8000/research/promotion-readiness',
+    expect.objectContaining({
+      method: 'GET',
+      headers: expect.objectContaining({ 'X-Internal-Secret': 'internal-test-secret' }),
+    }),
+  );
+});
+
+test.each([
+  ['proactive activity', '/analytics/proactive-activity?days=7'],
+  ['proactive comparison', '/analytics/proactive-comparison?days=90'],
+  ['proactive research comparison', '/analytics/proactive-research-comparison'],
+])('proxies authenticated %s evidence with its bounded query', async (_label, route) => {
+  const payload = { mode: 'SHADOW', research_only: true, can_place_orders: false };
+  global.fetch.mockResolvedValue({ status: 200, json: async () => payload });
+  const response = await request(makeApp()).get(`/api/proxy${route}`);
+  expect(response.status).toBe(200);
+  expect(response.body).toEqual(payload);
+  expect(global.fetch).toHaveBeenCalledWith(
+    `http://python-engine:8000${route}`,
+    expect.objectContaining({
+      method: 'GET',
+      headers: expect.objectContaining({ 'X-Internal-Secret': 'internal-test-secret' }),
+    }),
+  );
+});
+
+test('proactive comparison proxy requires a session', async () => {
+  const response = await request(makeApp(false)).get('/api/proxy/analytics/proactive-comparison?days=90');
+  expect(response.status).toBe(401);
+  expect(global.fetch).not.toHaveBeenCalled();
+});
+
+test.each([
+  ['optional AI status', '/analytics/optional-ai-status'],
+  ['five-session proactive diagnostics', '/analytics/proactive-session-diagnostics?sessions=5'],
+  ['partner hedge cards', '/partner/hedge/cards?limit=12'],
+  ['partner delivery backlog', '/partner/hedge/delivery-backlog'],
+  ['partner advisory research readiness', '/partner/advisory/research-readiness'],
+])('proxies authenticated %s evidence without granting authority', async (_label, route) => {
+  const payload = { can_place_orders: false, execution_authority: 'NONE' };
+  global.fetch.mockResolvedValue({ status: 200, json: async () => payload });
+  const response = await request(makeApp()).get(`/api/proxy${route}`);
+  expect(response.status).toBe(200);
+  expect(response.body).toEqual(payload);
+  expect(global.fetch).toHaveBeenCalledWith(
+    `http://python-engine:8000${route}`,
+    expect.objectContaining({
+      method: 'GET',
+      headers: expect.objectContaining({ 'X-Internal-Secret': 'internal-test-secret' }),
+    }),
+  );
+});

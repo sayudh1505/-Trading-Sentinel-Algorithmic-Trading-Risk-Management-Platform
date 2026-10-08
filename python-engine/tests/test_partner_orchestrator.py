@@ -1,0 +1,950 @@
+"""
+[PARTNER-TIPS-TESTS 2026-07-18] Orchestration (plan WS5): per-bar signal
+dedup (a restart or re-tick must never re-send a tip), the event
+throttle window, gating (disabled / non-trading day / session window),
+and the EOD signal-outcome walk.
+"""
+import json
+from datetime import date, datetime
+from types import SimpleNamespace
+
+import pandas as pd
+import pytest
+import pytz
+
+import partner_orchestrator as po
+from config import settings
+from fno_engine_mom import MomSignal
+from fno_models import FnoDirection
+from fno_signal_scan import UnderlyingScan
+from fno_underlyings import UnderlyingSpec
+
+IST = pytz.timezone("Asia/Kolkata")
+NOW = IST.localize(datetime(2026, 7, 20, 10, 3))   # Monday, inside session
+SPEC = UnderlyingSpec("NIFTY", "NFO")
+
+
+def _fired_scan(bar_ts="2026-07-20 09:55:00"):
+    sig = MomSignal(
+        bar_ts=bar_ts, direction=FnoDirection.LONG, close=25100.0,
+        or_high=25010.0, or_low=24990.0, atr=30.0, rvol=2.5,
+        stop_underlying=25055.0, target_underlying=25167.5,
+    )
+    return UnderlyingScan(name="NIFTY", sig=sig)
+
+
+class _Book:
+    def ready(self, today):
+        return True
+
+    def nearest_option_expiry(self, today):
+        return date(2026, 7, 23)
+
+    def is_expiry_day(self, day):
+        return False
+
+    def front_future(self, today):
+        return None
+
+
+class _AdvisoryBook(_Book):
+    """Instrument fixture with the expiry inventory advisory resolution needs."""
+
+    option_expiries = [date(2026, 7, 23)]
+
+
+@pytest.fixture
+def wired(tmp_path, monkeypatch):
+    import main
+
+    db = str(tmp_path / "partner.db")
+    monkeypatch.setattr(settings, "DB_PATH", db)
+    monkeypatch.setattr(settings, "RESEARCH_ARCHIVE_PATH", str(tmp_path / "research"))
+    monkeypatch.setattr(settings, "PARTNER_BOT_ENABLED", True)
+    # This module verifies the retained legacy partner surfaces explicitly.
+    # Hedge-first mode is the runtime default and suppresses these messages.
+    monkeypatch.setattr(settings, "PARTNER_HEDGE_ENABLED", False)
+    monkeypatch.setattr(settings, "PARTNER_MANUAL_ADVISORY_DELIVERY_ENABLED", False)
+    monkeypatch.setattr(settings, "PARTNER_TELEGRAM_BOT_TOKEN", "t")
+    monkeypatch.setattr(settings, "PARTNER_TELEGRAM_CHAT_ID", "c")
+
+    async def _open_day(*a, **kw):
+        return True
+
+    monkeypatch.setattr(main, "is_trading_day", _open_day)
+    monkeypatch.setattr(main, "kite", SimpleNamespace(access_token="tok"))
+    monkeypatch.setattr(main, "_fno_regime_str", lambda: "REGIME_1_NORMAL")
+
+    sent = []
+
+    async def _send(text, kind="partner_msg"):
+        sent.append((kind, text))
+        return True
+
+    monkeypatch.setattr(po, "send_partner", _send)
+    monkeypatch.setattr(po, "analytics_underlyings", lambda: [SPEC])
+    monkeypatch.setattr(po, "get_instruments_for", lambda name: _Book())
+
+    state = {"scan": _fired_scan(), "scan_calls": 0}
+
+    async def _scan(kite, spec, regime, now):
+        state["scan_calls"] += 1
+        return state["scan"]
+
+    monkeypatch.setattr(po, "scan_underlying", _scan)
+    # Manual advisory first asks for public futures data and only later
+    # attaches optional-chain entry evidence.  Preserve the fixture's
+    # deliberately controlled scan outcome across both phases.
+    monkeypatch.setattr(po, "observe_underlying", _scan)
+
+    async def _attach(_kite, scan, _now):
+        return scan
+
+    monkeypatch.setattr(po, "attach_entry_chain", _attach)
+
+    import asyncio
+    asyncio.get_event_loop()
+    return SimpleNamespace(db=db, sent=sent, state=state)
+
+
+async def _init(db):
+    await po.init_partner_db(db)
+
+
+# ---------------------------------------------------------------------------
+# gating
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('fail_capture', [False, True])
+async def test_candidate_capture_follows_both_management_paths_and_failure_isolated(wired, monkeypatch, fail_capture):
+    import partner_research_capture as capture
+    import partner_manual_advisory as advisory
+    await _init(wired.db)
+    monkeypatch.setattr(settings, 'PARTNER_MANUAL_ADVISORY_ENABLED', True)
+    monkeypatch.setattr(settings, 'RESEARCH_ARCHIVE_ENABLED', True)
+    monkeypatch.setattr(po, 'analytics_underlyings', lambda: [SPEC, UnderlyingSpec('SENSEX', 'BFO')])
+    monkeypatch.setattr(po, 'get_instruments_for', lambda name: _AdvisoryBook())
+    managed, captured, built = [], [], []
+    async def public(_kite, spec, *_args):
+        scan = _fired_scan()
+        scan.name = spec.name
+        scan.snap = SimpleNamespace(expiry=date(2026, 7, 23))
+        return scan
+    async def management(_db, *, underlying, **_kwargs):
+        managed.append(underlying)
+        return []
+    def retain(_root, **kwargs):
+        assert set(managed) == {'NIFTY', 'SENSEX'}
+        assert kwargs['received_at'] >= kwargs['evaluation_at']
+        captured.append(kwargs['snapshot'])
+        if fail_capture:
+            raise OSError('fixture disk full')
+        return {'state': 'OBSERVED'}
+    def build(*args, **kwargs):
+        built.append(args[0])
+        return None
+    monkeypatch.setattr(po, 'observe_underlying', public)
+    monkeypatch.setattr(advisory, 'queue_management_updates', management)
+    monkeypatch.setattr(advisory, 'build_directional_debit_spread', build)
+    monkeypatch.setattr(capture, 'persist_public_input', lambda *_args, **_kwargs: {'state': 'UNAVAILABLE'})
+    monkeypatch.setattr(capture, 'persist_candidate_input', retain)
+    await po.partner_manual_advisory_tick(NOW)
+    assert len(captured) == len(built) == 2
+    assert wired.sent == []
+
+
+@pytest.mark.asyncio
+async def test_delayed_chain_past_entry_deadline_cannot_create_backdated_candidate(wired, monkeypatch):
+    import partner_manual_advisory as advisory
+    await _init(wired.db)
+    tick = IST.localize(datetime(2026, 7, 20, 14, 44, 50))
+    public_received = tick.replace(second=55)
+    chain_received = tick.replace(minute=45, second=0)
+    decision_at = tick.replace(minute=45, second=1)
+    monkeypatch.setattr(settings, "PARTNER_MANUAL_ADVISORY_ENABLED", True)
+    monkeypatch.setattr(settings, "RESEARCH_ARCHIVE_ENABLED", False)
+    monkeypatch.setattr(po, "get_instruments_for", lambda _name: _AdvisoryBook())
+    built = []
+
+    async def public(_kite, spec, _regime, _now, **_kwargs):
+        scan = _fired_scan()
+        scan.name = spec.name
+        scan.public_requested_at = tick
+        scan.public_received_at = public_received
+        scan.research_received_at = public_received
+        scan.public_source_id = f"PUBLIC:{spec.name}"
+        return scan
+
+    async def attach(_kite, scan, _now, **_kwargs):
+        scan.chain_requested_at = public_received
+        scan.chain_received_at = chain_received
+        scan.chain_source_id = f"CHAIN:{scan.name}"
+        scan.snap = SimpleNamespace(expiry=date(2026, 7, 23), taken_at=chain_received)
+        return scan
+
+    monkeypatch.setattr(po, "observe_underlying", public)
+    monkeypatch.setattr(po, "attach_entry_chain", attach)
+    monkeypatch.setattr(advisory, "build_directional_debit_spread", lambda *args, **kwargs: built.append(args) or None)
+    await po.partner_manual_advisory_tick(tick, clock=lambda: decision_at)
+    assert built == []
+    assert wired.sent == []
+
+
+@pytest.mark.asyncio
+async def test_slow_archive_write_is_bounded_and_does_not_stop_candidate_evaluation(wired, monkeypatch):
+    import time
+    import partner_research_capture as capture
+    import partner_manual_advisory as advisory
+    await _init(wired.db)
+    monkeypatch.setattr(settings, "PARTNER_MANUAL_ADVISORY_ENABLED", True)
+    monkeypatch.setattr(settings, "RESEARCH_ARCHIVE_ENABLED", True)
+    monkeypatch.setattr(settings, "RESEARCH_CAPTURE_WAIT_TIMEOUT_SEC", 0.03)
+    monkeypatch.setattr(po, "get_instruments_for", lambda _name: _AdvisoryBook())
+    scan = _fired_scan()
+    scan.snap = SimpleNamespace(expiry=date(2026, 7, 23), taken_at=NOW)
+    wired.state["scan"] = scan
+    monkeypatch.setattr(capture, "persist_public_input", lambda *_args, **_kwargs: {"state": "UNAVAILABLE"})
+
+    def slow_capture(*_args, **_kwargs):
+        time.sleep(0.2)
+        return {"state": "OBSERVED", "path": "late.json"}
+
+    built = []
+    monkeypatch.setattr(capture, "persist_candidate_input", slow_capture)
+    monkeypatch.setattr(advisory, "build_directional_debit_spread", lambda *args, **kwargs: built.append(args) or None)
+    await po.partner_manual_advisory_tick(NOW)
+    assert len(built) == 2
+    assert wired.sent == []
+    await __import__("asyncio").sleep(0.25)
+
+@pytest.mark.asyncio
+async def test_disabled_is_a_total_noop(wired, monkeypatch):
+    await _init(wired.db)
+    monkeypatch.setattr(settings, "PARTNER_BOT_ENABLED", False)
+    await po.partner_scan_tick(NOW)
+    await po.partner_analytics_tick(NOW)
+    await po.partner_morning_brief(NOW)
+    assert wired.state["scan_calls"] == 0
+    assert wired.sent == []
+
+
+@pytest.mark.asyncio
+async def test_non_trading_day_is_a_noop(wired, monkeypatch):
+    await _init(wired.db)
+    import main
+
+    async def _closed(*a, **kw):
+        return False
+
+    monkeypatch.setattr(main, "is_trading_day", _closed)
+    await po.partner_scan_tick(NOW)
+    assert wired.state["scan_calls"] == 0
+
+
+@pytest.mark.asyncio
+async def test_outside_session_window_is_a_noop(wired):
+    await _init(wired.db)
+    late = IST.localize(datetime(2026, 7, 20, 16, 30))
+    await po.partner_scan_tick(late)
+    assert wired.state["scan_calls"] == 0
+
+
+@pytest.mark.asyncio
+async def test_manual_tick_classifies_no_direction_without_chain_and_updates_active_conditions(wired, monkeypatch):
+    """No ORB break is a healthy no-entry result, not an input outage.
+
+    The scanner contract deliberately has no chain snapshot in this case, yet
+    fresh futures-bar data still drives public-condition management checks.
+    """
+    from partner_manual_advisory import load_advisory_input_status
+    from fno_underlyings import UnderlyingSpec
+    await _init(wired.db)
+    monkeypatch.setattr(settings, "PARTNER_MANUAL_ADVISORY_ENABLED", True)
+    monkeypatch.setattr(settings, "PARTNER_MANUAL_ADVISORY_SHADOW_ENABLED", False)
+    sensex = UnderlyingSpec("SENSEX", "BFO")
+    monkeypatch.setattr(po, "analytics_underlyings", lambda: [SPEC, sensex])
+    scans = {
+        "NIFTY": UnderlyingScan(name="NIFTY", sig=MomSignal(
+            bar_ts="2026-07-20 09:55:00", close=25100.0, reject_reason="no_or_break")),
+        "SENSEX": UnderlyingScan(name="SENSEX", sig=MomSignal(
+            bar_ts="2026-07-20 09:55:00", close=82000.0, reject_reason="rvol_below_min")),
+    }
+    async def scan(_kite, spec, _regime, _now): return scans[spec.name]
+    observed = []
+    async def management(_db, *, underlying, observed_underlying, observed_at):
+        observed.append((underlying, observed_underlying, observed_at)); return []
+    monkeypatch.setattr(po, "observe_underlying", scan)
+    monkeypatch.setattr(__import__("partner_manual_advisory"), "queue_management_updates", management)
+    # partner_orchestrator imports this name lazily, so patch its module
+    # binding after one controlled tick import path has executed.
+    monkeypatch.setattr(po, "queue_management_updates", management, raising=False)
+    await po.partner_manual_advisory_tick(NOW)
+    status = await load_advisory_input_status(wired.db)
+    assert status["NIFTY"]["stage"] == "NO_ENTRY_SETUP"
+    assert status["NIFTY"]["reason"] == "no_or_break"
+    assert status["SENSEX"]["stage"] == "NO_ENTRY_SETUP"
+    assert {row[0] for row in observed} == {"NIFTY", "SENSEX"}
+
+
+@pytest.mark.asyncio
+async def test_manual_tick_keeps_explicit_input_error_separate_from_missing_signal(wired, monkeypatch):
+    from partner_manual_advisory import load_advisory_input_status
+    from fno_underlyings import UnderlyingSpec
+    await _init(wired.db)
+    monkeypatch.setattr(settings, "PARTNER_MANUAL_ADVISORY_ENABLED", True)
+    sensex = UnderlyingSpec("SENSEX", "BFO")
+    monkeypatch.setattr(po, "analytics_underlyings", lambda: [SPEC, sensex])
+    monkeypatch.setattr(po, "get_instruments_for", lambda _name: _AdvisoryBook())
+    async def scan(_kite, spec, _regime, _now):
+        return UnderlyingScan(name=spec.name, error="instruments_not_ready") if spec.name == "NIFTY" else UnderlyingScan(name=spec.name)
+    monkeypatch.setattr(po, "observe_underlying", scan)
+    await po.partner_manual_advisory_tick(NOW)
+    status = await load_advisory_input_status(wired.db)
+    assert status["NIFTY"]["stage"] == "INPUT_ERROR"
+    assert status["NIFTY"]["reason"] == "instruments_not_ready"
+    assert status["SENSEX"]["stage"] == "MISSING_SIGNAL"
+
+
+@pytest.mark.asyncio
+async def test_manual_tick_records_fired_direction_without_snapshot_as_unavailable(wired, monkeypatch):
+    from partner_manual_advisory import load_advisory_input_status
+    from fno_underlyings import UnderlyingSpec
+    await _init(wired.db)
+    monkeypatch.setattr(settings, "PARTNER_MANUAL_ADVISORY_ENABLED", True)
+    sensex = UnderlyingSpec("SENSEX", "BFO")
+    monkeypatch.setattr(po, "analytics_underlyings", lambda: [SPEC, sensex])
+    monkeypatch.setattr(po, "get_instruments_for", lambda _name: _AdvisoryBook())
+    async def scan(_kite, spec, _regime, _now):
+        return _fired_scan() if spec.name == "NIFTY" else UnderlyingScan(name="SENSEX", error="instruments_not_ready")
+    monkeypatch.setattr(po, "observe_underlying", scan)
+    await po.partner_manual_advisory_tick(NOW)
+    status = await load_advisory_input_status(wired.db)
+    assert status["NIFTY"]["stage"] == "DIRECTION_WITHOUT_CHAIN"
+    assert status["NIFTY"]["entry_state"] == "UNAVAILABLE"
+
+
+@pytest.mark.asyncio
+async def test_chain_failure_still_processes_active_public_invalidation(wired, monkeypatch):
+    """Entry-chain acquisition is not allowed to suppress active management."""
+    await _init(wired.db)
+    monkeypatch.setattr(settings, "PARTNER_MANUAL_ADVISORY_ENABLED", True)
+    monkeypatch.setattr(po, "analytics_underlyings", lambda: [SPEC])
+    monkeypatch.setattr(po, "get_instruments_for", lambda _name: _AdvisoryBook())
+    scan = _fired_scan()
+    scan.entry_error = "chain_unavailable"
+    async def public_but_chain_failed(_kite, spec, *_args, **_kwargs):
+        return scan if spec.name == "NIFTY" else UnderlyingScan(name="SENSEX", error="fixture_unavailable")
+    queued, dispatched = [], []
+    async def manage(_db, *, underlying, observed_underlying, observed_at):
+        queued.append((underlying, observed_underlying, observed_at))
+        return [{"update_id": "invalidation-fixture"}]
+    async def dispatch(_db, update, *, now):
+        dispatched.append((update, now)); return True
+    monkeypatch.setattr(po, "observe_underlying", public_but_chain_failed)
+    advisory = __import__("partner_manual_advisory")
+    monkeypatch.setattr(advisory, "queue_management_updates", manage)
+    monkeypatch.setattr(advisory, "dispatch_queued_management_update", dispatch)
+    await po.partner_manual_advisory_tick(NOW)
+    assert queued and queued[0][0] == "NIFTY"
+    assert dispatched == [({"update_id": "invalidation-fixture"}, NOW)]
+
+
+@pytest.mark.asyncio
+async def test_active_management_runs_before_a_slow_entry_chain(wired, monkeypatch):
+    """An optional entry quote must not hold a published idea's lifecycle."""
+    import asyncio
+
+    await _init(wired.db)
+    monkeypatch.setattr(settings, "PARTNER_MANUAL_ADVISORY_ENABLED", True)
+    monkeypatch.setattr(po, "analytics_underlyings", lambda: [SPEC])
+    monkeypatch.setattr(po, "get_instruments_for", lambda _name: _AdvisoryBook())
+    order, chain_started, release_chain = [], asyncio.Event(), asyncio.Event()
+
+    async def public(_kite, _spec, *_args):
+        order.append("public")
+        return _fired_scan()
+
+    async def slow_chain(_kite, scan, _now):
+        order.append("chain")
+        chain_started.set()
+        await release_chain.wait()
+        scan.entry_error = "chain_unavailable"
+        return scan
+
+    async def management(_db, **_kwargs):
+        order.append("management")
+        return [{"update_id": "urgent"}]
+
+    async def dispatch(_db, update, **_kwargs):
+        order.append("dispatch")
+        return True
+
+    monkeypatch.setattr(__import__("partner_manual_advisory"), "dispatch_queued_management_update", dispatch)
+    monkeypatch.setattr(po, "observe_underlying", public)
+    monkeypatch.setattr(po, "attach_entry_chain", slow_chain)
+    monkeypatch.setattr(__import__("partner_manual_advisory"), "queue_management_updates", management)
+    task = asyncio.create_task(po.partner_manual_advisory_tick(NOW))
+    try:
+        await asyncio.wait_for(chain_started.wait(), timeout=1)
+        # Both configured indices complete public lifecycle work before the
+        # first optional chain is permitted to block.
+        assert order.index("chain") > max(
+            position for position, item in enumerate(order)
+            if item in {"management", "dispatch"}
+        )
+    finally:
+        release_chain.set()
+        await task
+
+
+@pytest.mark.asyncio
+async def test_slow_first_index_entry_chain_cannot_delay_second_index_lifecycle(wired, monkeypatch):
+    """All public index facts are managed before any optional chain awaits."""
+    import asyncio
+
+    await _init(wired.db)
+    monkeypatch.setattr(settings, "PARTNER_MANUAL_ADVISORY_ENABLED", True)
+    sensex = UnderlyingSpec("SENSEX", "BFO")
+    monkeypatch.setattr(po, "analytics_underlyings", lambda: [SPEC, sensex])
+    monkeypatch.setattr(po, "get_instruments_for", lambda _name: _AdvisoryBook())
+    second_observed, first_chain_started, release_chain = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    managed = []
+
+    async def public(_kite, spec, *_args):
+        if spec.name == "SENSEX":
+            second_observed.set()
+        result = _fired_scan()
+        result.name = spec.name
+        return result
+
+    async def slow_first_chain(_kite, scan, _now):
+        if scan.name == "NIFTY":
+            first_chain_started.set()
+            await release_chain.wait()
+        scan.entry_error = "chain_unavailable"
+        return scan
+
+    async def management(_db, *, underlying, **_kwargs):
+        managed.append(underlying)
+        return []
+
+    monkeypatch.setattr(po, "observe_underlying", public)
+    monkeypatch.setattr(po, "attach_entry_chain", slow_first_chain)
+    monkeypatch.setattr(__import__("partner_manual_advisory"), "queue_management_updates", management)
+    task = asyncio.create_task(po.partner_manual_advisory_tick(NOW))
+    try:
+        await asyncio.wait_for(first_chain_started.wait(), timeout=1)
+        assert second_observed.is_set()
+        assert set(managed) == {"NIFTY", "SENSEX"}
+    finally:
+        release_chain.set()
+        await task
+
+
+@pytest.mark.asyncio
+async def test_manual_tick_records_fresh_expiry_chain_failure(wired, monkeypatch):
+    from fno_chain import ChainSnapshot
+    from partner_manual_advisory import load_advisory_input_status
+    from fno_underlyings import UnderlyingSpec
+    await _init(wired.db)
+    monkeypatch.setattr(settings, "PARTNER_MANUAL_ADVISORY_ENABLED", True)
+    sensex = UnderlyingSpec("SENSEX", "BFO")
+    monkeypatch.setattr(po, "analytics_underlyings", lambda: [SPEC, sensex])
+    monkeypatch.setattr(po, "get_instruments_for", lambda _name: _AdvisoryBook())
+    fired = _fired_scan()
+    # The scanner's regular-chain expiry differs from the advisory expiry,
+    # forcing the bounded fresh-chain request below.
+    fired.snap = ChainSnapshot(NOW, date(2026, 7, 16), 25100.0, None, 75, None, {})
+    async def scan(_kite, spec, _regime, _now):
+        return fired if spec.name == "NIFTY" else UnderlyingScan(name="SENSEX", error="instruments_not_ready")
+    async def no_fresh_chain(*_args, **_kwargs): return None
+    monkeypatch.setattr(po, "observe_underlying", scan)
+    monkeypatch.setattr(__import__("fno_chain"), "take_chain_snapshot", no_fresh_chain)
+    await po.partner_manual_advisory_tick(NOW)
+    status = await load_advisory_input_status(wired.db)
+    assert status["NIFTY"]["stage"] == "CHAIN_UNAVAILABLE"
+    assert status["NIFTY"]["reason"] == "advisory_expiry_chain_unavailable"
+
+
+# ---------------------------------------------------------------------------
+# signal tips: per-bar dedup
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_signal_tip_sent_once_per_bar(wired):
+    await _init(wired.db)
+    await po.partner_scan_tick(NOW)
+    await po.partner_scan_tick(NOW)     # same bar re-scanned next tick
+    tips = [s for s in wired.sent if s[0] == "signal"]
+    assert len(tips) == 1
+    assert "NIFTY ORB LONG" in tips[0][1]
+    assert "you own the trade" in tips[0][1]
+
+
+@pytest.mark.asyncio
+async def test_new_bar_gets_a_new_tip(wired):
+    await _init(wired.db)
+    await po.partner_scan_tick(NOW)
+    wired.state["scan"] = _fired_scan(bar_ts="2026-07-20 10:15:00")
+    await po.partner_scan_tick(NOW)
+    assert len([s for s in wired.sent if s[0] == "signal"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_signal_detail_persisted_for_eod(wired):
+    await _init(wired.db)
+    await po.partner_scan_tick(NOW)
+    import aiosqlite
+
+    async with aiosqlite.connect(wired.db) as db:
+        cur = await db.execute(
+            "SELECT detail FROM partner_messages WHERE kind='signal'"
+        )
+        (detail_json,) = await cur.fetchone()
+    detail = json.loads(detail_json)
+    assert detail["direction"] == "LONG"
+    assert detail["stop"] == 25055.0 and detail["target"] == 25167.5
+
+
+# ---------------------------------------------------------------------------
+# event throttle
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_event_throttle_window(wired):
+    await _init(wired.db)
+    await po._send_event(wired.db, "pcr_shift", "NIFTY", "shift 1", NOW)
+    await po._send_event(wired.db, "pcr_shift", "NIFTY", "shift 2", NOW)
+    assert len(wired.sent) == 1
+
+    # age the record past the gap -> the next event goes out
+    import aiosqlite
+
+    old = (NOW.replace(tzinfo=None)).strftime("%Y-%m-%d %H:%M:%S")
+    aged = "2026-07-20 08:00:00"
+    async with aiosqlite.connect(wired.db) as db:
+        await db.execute(
+            "UPDATE partner_messages SET sent_at=? WHERE sent_at=?", (aged, old)
+        )
+        await db.commit()
+    await po._send_event(wired.db, "pcr_shift", "NIFTY", "shift 3", NOW)
+    assert len(wired.sent) == 2
+
+
+@pytest.mark.asyncio
+async def test_event_kinds_throttle_independently(wired):
+    await _init(wired.db)
+    await po._send_event(wired.db, "pcr_shift", "NIFTY", "a", NOW)
+    await po._send_event(wired.db, "iv_move", "NIFTY", "b", NOW)
+    assert len(wired.sent) == 2
+
+
+# ---------------------------------------------------------------------------
+# morning brief / EOD dedup
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_morning_brief_once_per_day(wired, monkeypatch):
+    await _init(wired.db)
+
+    async def _no_chain(kite, book, now, strike_window=None):
+        return None
+
+    monkeypatch.setattr(po, "take_chain_snapshot", _no_chain)
+    wired.state["scan"] = UnderlyingScan(name="NIFTY", sig=MomSignal(
+        bar_ts="", or_high=25010.0, or_low=24990.0, atr=30.0, close=25000.0,
+    ))
+    await po.partner_morning_brief(NOW)
+    await po.partner_morning_brief(NOW)
+    briefs = [s for s in wired.sent if s[0] == "brief"]
+    assert len(briefs) == 1
+    assert "Partner brief" in briefs[0][1]
+
+
+# ---------------------------------------------------------------------------
+# EOD signal-outcome walk
+# ---------------------------------------------------------------------------
+
+def _bars(rows):
+    idx = pd.to_datetime([f"2026-07-20 {hm}" for hm, *_ in rows])
+    cols = list(zip(*[r[1:] for r in rows]))
+    return pd.DataFrame({
+        "open": cols[0], "high": cols[1], "low": cols[2], "close": cols[3],
+    }, index=idx)
+
+
+DETAIL = {
+    "direction": "LONG", "bar_ts": "2026-07-20 09:55:00",
+    "close": 25100.0, "stop": 25055.0, "target": 25167.5,
+}
+
+
+def test_outcome_target_first():
+    bars = _bars([
+        ("09:55", 25010, 25105, 25005, 25100),
+        ("10:00", 25100, 25170, 25090, 25160),   # target prints
+        ("10:05", 25160, 25165, 25050, 25060),   # stop later: irrelevant
+    ])
+    text, kind, r = po._signal_outcome(bars, DETAIL)
+    assert "target" in text
+    assert kind == "target"
+    # 67.5 pts target / 45 pts risk = 1.5R by construction
+    assert r == pytest.approx(1.5)
+
+
+def test_outcome_stop_first():
+    bars = _bars([
+        ("09:55", 25010, 25105, 25005, 25100),
+        ("10:00", 25100, 25110, 25050, 25060),   # stop prints
+        ("10:05", 25060, 25200, 25055, 25190),   # target later: irrelevant
+    ])
+    text, kind, r = po._signal_outcome(bars, DETAIL)
+    assert "stop" in text
+    assert kind == "stop"
+    assert r == pytest.approx(-1.0)
+
+
+def test_outcome_neither_reports_close():
+    bars = _bars([
+        ("09:55", 25010, 25105, 25005, 25100),
+        ("10:00", 25100, 25120, 25080, 25110),
+    ])
+    text, kind, r = po._signal_outcome(bars, DETAIL)
+    assert "neither printed" in text and "25,110" in text
+    assert kind == "neither"
+    # +10 pts on 45 pts risk
+    assert r == pytest.approx(10.0 / 45.0)
+
+
+def test_outcome_unavailable_on_garbage():
+    text, kind, r = po._signal_outcome(None, {"bar_ts": "not-a-ts"})
+    assert kind is None and r is None
+    assert "unavailable" in text
+
+
+# ---------------------------------------------------------------------------
+# [PARTNER-ENRICH 2026-07-19] track record (T1c)
+# ---------------------------------------------------------------------------
+
+async def _seed_signal(db, key, detail, sent_at="2026-07-15 10:00:00"):
+    import aiosqlite
+    async with aiosqlite.connect(db) as conn:
+        await conn.execute(
+            "INSERT OR REPLACE INTO partner_messages "
+            "(sent_at, kind, dedup_key, delivered, detail) VALUES (?,?,?,?,?)",
+            (sent_at, "signal", key, 1, json.dumps(detail)),
+        )
+        await conn.commit()
+
+
+@pytest.mark.asyncio
+async def test_track_record_aggregates_resolved_signals(wired, monkeypatch):
+    await _init(wired.db)
+    monkeypatch.setattr(settings, "PARTNER_TRACK_MIN_N", 3)
+    base = {"direction": "LONG", "close": 25100.0, "stop": 25055.0}
+    outcomes = [("target", 1.5), ("stop", -1.0), ("target", 1.5), ("neither", 0.2)]
+    for i, (kind, r) in enumerate(outcomes):
+        await _seed_signal(
+            wired.db, f"NIFTY:2026-07-1{i} 09:55:00",
+            dict(base, outcome_kind=kind, outcome_r=r),
+        )
+    # Unresolved signal today + SHORT signal must both be excluded.
+    await _seed_signal(wired.db, "NIFTY:2026-07-20 09:55:00", dict(base))
+    await _seed_signal(
+        wired.db, "NIFTY:2026-07-16 11:00:00",
+        {"direction": "SHORT", "outcome_kind": "stop", "outcome_r": -1.0},
+    )
+    line = await po._track_record(wired.db, "NIFTY", "LONG", NOW)
+    assert "2/4 target-first" in line
+    # (1.5 - 1.0 + 1.5 + 0.2) / 4 = 0.55 -> +0.6R
+    assert "avg +0.6R" in line
+
+
+@pytest.mark.asyncio
+async def test_track_record_empty_below_min_sample(wired, monkeypatch):
+    await _init(wired.db)
+    monkeypatch.setattr(settings, "PARTNER_TRACK_MIN_N", 5)
+    await _seed_signal(
+        wired.db, "NIFTY:2026-07-15 09:55:00",
+        {"direction": "LONG", "outcome_kind": "target", "outcome_r": 1.5},
+    )
+    assert await po._track_record(wired.db, "NIFTY", "LONG", NOW) == ""
+
+
+@pytest.mark.asyncio
+async def test_stamp_outcome_roundtrip(wired):
+    import aiosqlite
+    await _init(wired.db)
+    detail = {"direction": "LONG", "bar_ts": "2026-07-20 09:55:00"}
+    await _seed_signal(wired.db, "NIFTY:2026-07-20 09:55:00", detail,
+                       sent_at="2026-07-20 09:56:40")
+    await po._stamp_outcome(
+        wired.db, "NIFTY:2026-07-20 09:55:00", detail, "target", 1.5,
+    )
+    async with aiosqlite.connect(wired.db) as conn:
+        cur = await conn.execute(
+            "SELECT sent_at, detail FROM partner_messages WHERE dedup_key=?",
+            ("NIFTY:2026-07-20 09:55:00",),
+        )
+        sent_at, detail_json = await cur.fetchone()
+    stamped = json.loads(detail_json)
+    assert stamped["outcome_kind"] == "target"
+    assert stamped["outcome_r"] == 1.5
+    # sent_at untouched: it doubles as the retention timestamp.
+    assert sent_at == "2026-07-20 09:56:40"
+
+
+# ---------------------------------------------------------------------------
+# [PARTNER-ENRICH 2026-07-19] option premium outcome (T2b)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_option_outcome_line_from_ltp_series(wired):
+    import fno_oi_store
+    await fno_oi_store.init_oi_db(wired.db)
+    import aiosqlite
+    async with aiosqlite.connect(wired.db) as conn:
+        for ts, ltp in [
+            ("2026-07-20 09:50:00", 100.0),   # before the signal: excluded
+            ("2026-07-20 10:00:00", 120.0),
+            ("2026-07-20 10:05:00", 156.0),
+            ("2026-07-20 15:25:00", 140.0),
+        ]:
+            await conn.execute(
+                "INSERT INTO fno_chain_oi "
+                "(snap_ts, underlying, expiry, strike, opt_type, oi, volume, ltp, iv) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (ts, "NIFTY", "2026-07-23", 25000.0, "CE", 1000, 100, ltp, 0.12),
+            )
+        await conn.commit()
+    detail = {
+        "underlying": "NIFTY", "bar_ts": "2026-07-20 09:55:00",
+        "tradingsymbol": "NIFTY25JUL25000CE", "strike": 25000.0,
+        "opt_type": "CE", "expiry": "2026-07-23", "premium_paid": 112.0,
+    }
+    line = await po._option_outcome_line(detail, "2026-07-20")
+    assert "paid ~112.0" in line
+    assert "peak 156.0 (+39%)" in line
+    assert "last 140.0 (+25%)" in line
+
+
+@pytest.mark.asyncio
+async def test_option_outcome_line_empty_without_option_or_rows(wired):
+    import fno_oi_store
+    await fno_oi_store.init_oi_db(wired.db)
+    assert await po._option_outcome_line({"direction": "LONG"}, "2026-07-20") == ""
+    detail = {
+        "underlying": "NIFTY", "tradingsymbol": "X", "strike": 25000.0,
+        "opt_type": "CE", "expiry": "2026-07-23", "premium_paid": 112.0,
+    }
+    assert await po._option_outcome_line(detail, "2026-07-20") == ""
+
+
+# ---------------------------------------------------------------------------
+# [PARTNER-ENRICH 2026-07-19] scan tick with a strike pick (T1a/T1d wiring)
+# ---------------------------------------------------------------------------
+
+def _chain_quote(strike, ot, oi, ltp, lot_size=75):
+    from fno_models import Contract, ContractQuote
+    c = Contract(
+        token=int(strike) * 10 + (1 if ot == "CE" else 2),
+        tradingsymbol=f"NIFTY25JUL{int(strike)}{ot}",
+        name="NIFTY", expiry=date(2026, 7, 23), strike=float(strike),
+        instrument_type=ot, lot_size=lot_size,
+    )
+    return ContractQuote(
+        contract=c, bid=ltp - 0.5, ask=ltp + 0.5, ltp=ltp,
+        oi=oi, volume=50000,
+    )
+
+
+def _mk_snap(oi_and_ltp, forward=25100.0, now=NOW):
+    """oi_and_ltp: {(strike, ot): (oi, ltp)}"""
+    from fno_chain import ChainSnapshot
+    from fno_models import Contract, ContractQuote
+    quotes = {
+        (float(k), ot): _chain_quote(k, ot, oi, ltp)
+        for (k, ot), (oi, ltp) in oi_and_ltp.items()
+    }
+    fut_c = Contract(
+        token=900, tradingsymbol="NIFTYFUT", name="NIFTY",
+        expiry=date(2026, 7, 30), strike=0.0, instrument_type="FUT",
+        lot_size=75,
+    )
+    fut_q = ContractQuote(
+        contract=fut_c, bid=forward - 1, ask=forward + 1, ltp=forward,
+        oi=200000,
+    )
+    return ChainSnapshot(
+        taken_at=now, expiry=date(2026, 7, 23), forward=forward,
+        parity_forward=None, lot_size=75, fut_quote=fut_q, quotes=quotes,
+    )
+
+
+@pytest.mark.asyncio
+async def test_scan_tick_with_pick_ships_scenarios_and_sizing(wired):
+    await _init(wired.db)
+    scan = _fired_scan()
+    scan.snap = _mk_snap({(25100, "CE"): (150000, 112.0)})
+    scan.pick = (scan.snap.quotes[(25100.0, "CE")], 0.12, 0.55)
+    wired.state["scan"] = scan
+    await po.partner_scan_tick(NOW)
+    tips = [s for s in wired.sent if s[0] == "signal"]
+    assert len(tips) == 1
+    msg = tips[0][1]
+    assert "at target ≈" in msg and "at stop ≈" in msg
+    assert "option RR ≈" in msg
+    assert "risk to stop" in msg
+    # detail now carries what the EOD premium-path needs
+    import aiosqlite
+    async with aiosqlite.connect(wired.db) as db:
+        cur = await db.execute(
+            "SELECT detail FROM partner_messages WHERE kind='signal'"
+        )
+        (detail_json,) = await cur.fetchone()
+    detail = json.loads(detail_json)
+    assert detail["strike"] == 25100.0
+    assert detail["opt_type"] == "CE"
+    assert detail["expiry"] == "2026-07-23"
+    assert detail["premium_paid"] == pytest.approx(112.5)  # ask side
+
+
+# ---------------------------------------------------------------------------
+# [PARTNER-ENRICH 2026-07-19] analytics tick: wall flow (T2a) + pin (T3a)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def analytics_wired(wired, monkeypatch):
+    import asyncio
+    import main
+
+    monkeypatch.setattr(main, "state_lock", asyncio.Lock())
+
+    async def _no_halt(db_path):
+        return False, []
+
+    monkeypatch.setattr(main, "check_circuit_breakers", _no_halt)
+    monkeypatch.setattr(main, "momentum_signals_today", [], raising=False)
+    monkeypatch.setattr(po, "load_underlying_names", lambda: set())
+    # module-global event state must not leak across tests
+    monkeypatch.setattr(po, "_last_wall_flow_reported", {})
+    monkeypatch.setattr(po, "_last_walls_reported", {})
+    monkeypatch.setattr(po, "_last_iv_reported", {})
+    monkeypatch.setattr(po, "_last_regime_reported", None)
+    monkeypatch.setattr(po, "_halt_reported_on", None)
+
+    state = {"snap": None}
+
+    async def _chain(kite, book, now, strike_window=None):
+        return state["snap"]
+
+    monkeypatch.setattr(po, "take_chain_snapshot", _chain)
+    wired.analytics = state
+    return wired
+
+
+BASE_CHAIN = {
+    (24900, "PE"): (10000, 40.0), (24900, "CE"): (2000, 240.0),
+    (25100, "PE"): (3000, 90.0), (25100, "CE"): (10000, 110.0),
+}
+
+
+@pytest.mark.asyncio
+async def test_wall_flow_fires_on_oi_build_and_not_on_repeat(analytics_wired):
+    import fno_oi_store
+    w = analytics_wired
+    await _init(w.db)
+    await fno_oi_store.init_oi_db(w.db)
+    # tick 1 (baseline snapshot persists; no baseline delta yet)
+    w.analytics["snap"] = _mk_snap(BASE_CHAIN)
+    await po.partner_analytics_tick(NOW)
+    assert [s for s in w.sent if s[0] == "wall_flow"] == []
+    # tick 2: support strike PE OI +30% vs open -> defended event
+    # (distinct taken_at, else the snapshot row REPLACEs the baseline)
+    grown = dict(BASE_CHAIN)
+    grown[(24900, "PE")] = (13000, 40.0)
+    later = IST.localize(datetime(2026, 7, 20, 10, 33))
+    w.analytics["snap"] = _mk_snap(grown, now=later)
+    await po.partner_analytics_tick(later)
+    flows = [s for s in w.sent if s[0] == "wall_flow"]
+    assert len(flows) == 1
+    assert "Support 24,900 PE OI +30% vs open" in flows[0][1]
+    assert "defended" in flows[0][1]
+    # tick 3: unchanged OI -> no re-report
+    even_later = IST.localize(datetime(2026, 7, 20, 11, 33))
+    await po.partner_analytics_tick(even_later)
+    assert len([s for s in w.sent if s[0] == "wall_flow"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_wall_flow_support_and_resistance_both_fire_same_tick(analytics_wired):
+    """Regression: support (PE) and resistance (CE) throttle independently.
+    With a shared throttle key the second one was silently dropped."""
+    import fno_oi_store
+    w = analytics_wired
+    await _init(w.db)
+    await fno_oi_store.init_oi_db(w.db)
+    w.analytics["snap"] = _mk_snap(BASE_CHAIN)
+    await po.partner_analytics_tick(NOW)
+    # both walls move >= threshold in the same later tick
+    grown = dict(BASE_CHAIN)
+    grown[(24900, "PE")] = (13000, 40.0)   # support PE +30%
+    grown[(25100, "CE")] = (13000, 110.0)  # resistance CE +30%
+    later = IST.localize(datetime(2026, 7, 20, 10, 33))
+    w.analytics["snap"] = _mk_snap(grown, now=later)
+    await po.partner_analytics_tick(later)
+    flows = [s for s in w.sent if s[0] == "wall_flow"]
+    assert len(flows) == 2
+    joined = " ".join(f[1] for f in flows)
+    assert "Support 24,900 PE" in joined
+    assert "Resistance 25,100 CE" in joined
+
+
+@pytest.mark.asyncio
+async def test_pin_note_once_on_expiry_afternoon(analytics_wired, monkeypatch):
+    import fno_oi_store
+    w = analytics_wired
+    await _init(w.db)
+    await fno_oi_store.init_oi_db(w.db)
+
+    class _ExpiryBook(_Book):
+        def is_expiry_day(self, day):
+            return True
+
+    monkeypatch.setattr(po, "get_instruments_for", lambda name: _ExpiryBook())
+    w.analytics["snap"] = _mk_snap(BASE_CHAIN)
+    afternoon = IST.localize(datetime(2026, 7, 20, 13, 35))
+    await po.partner_analytics_tick(afternoon)
+    pins = [s for s in w.sent if s[0] == "pin"]
+    assert len(pins) == 1
+    assert "max pain" in pins[0][1]
+    # re-tick: once per day only
+    await po.partner_analytics_tick(
+        IST.localize(datetime(2026, 7, 20, 14, 35))
+    )
+    assert len([s for s in w.sent if s[0] == "pin"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_no_pin_before_1330_or_off_expiry(analytics_wired):
+    import fno_oi_store
+    w = analytics_wired
+    await _init(w.db)
+    await fno_oi_store.init_oi_db(w.db)
+    w.analytics["snap"] = _mk_snap(BASE_CHAIN)
+    # _Book.is_expiry_day is False -> never a pin even in the afternoon
+    await po.partner_analytics_tick(
+        IST.localize(datetime(2026, 7, 20, 14, 35))
+    )
+    assert [s for s in w.sent if s[0] == "pin"] == []
+
+
+@pytest.mark.parametrize("price", [float("nan"), float("inf"), float("-inf"), True])
+def test_management_rejects_nonfinite_or_boolean_price(price):
+    from types import SimpleNamespace
+    sig = SimpleNamespace(bar_ts="2026-07-20 10:25:00", close=price)
+    observed, value, reason = po._closed_bar_observation(sig, IST.localize(datetime(2026, 7, 20, 10, 30)))
+    assert observed is None and value is None
+    assert reason == "bar_close_unusable"

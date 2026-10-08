@@ -1,0 +1,1722 @@
+import asyncio
+import os
+import re
+import time
+from typing import Optional
+import httpx
+import sqlite3
+import pandas as pd
+import structlog
+from datetime import datetime, timedelta, timezone
+import aiosqlite
+from config import settings
+from halt_switch import TradingHalted, assert_not_halted, trip as trip_halt
+from owner_entry_halt import is_owner_entry_halted
+from order_execution_readiness import (
+    is_permission_or_static_ip_rejection,
+    mark_authorized as mark_order_execution_authorized,
+    mark_blocked as mark_order_execution_blocked,
+)
+
+logger = structlog.get_logger()
+
+_LEGACY_INTRADAY_INTERVAL = "legacy_unknown"
+
+# Cache reads and writes share /data/cache.db with the scanners, scheduler,
+# and partner advisory jobs.  The default sqlite timeout (5s) is too short for
+# the brief writer bursts produced by a full momentum scan; the 2026-09-03
+# Production audit recorded two otherwise recoverable ``database is locked``
+# failures.  Keep the wait bounded (rather than retrying indefinitely), and
+# apply it to every connection opened by this client.
+SQLITE_OPERATION_TIMEOUT_SEC = 30.0
+
+
+def _interval_minutes(interval: str) -> int:
+    """Return the candle width used to decide whether a cache is current.
+
+    Kite names its one-minute interval ``minute`` and the wider intraday
+    intervals ``3minute``, ``5minute`` ... ``60minute``.  Rejecting unknown
+    values here is safer than silently applying the old 15-minute freshness
+    rule to a new interval.
+
+    [WORKFLOW-H H4.B 2026-09-13] ``day`` is also supported: ``partner_orchestrator``
+    calls ``get_intraday_by_token(..., interval="day")`` for the realised-vol
+    computation. A daily candle has no "minute-level" freshness concern; the
+    freshness gate for daily uses a 24-hour (1440-minute) window. The §12
+    forming-bar filter exempts daily in
+    ``_INTERVALS_EXEMPT_FROM_FORMING_FILTER``.
+    """
+    value = str(interval or "").strip().lower()
+    if value == "minute":
+        return 1
+    if value == "day":
+        return 1440
+    match = re.fullmatch(r"([1-9][0-9]*)minute", value)
+    if match:
+        return int(match.group(1))
+    raise ValueError(f"unsupported intraday interval: {interval!r}")
+
+
+# Intervals that are exempt from the §12 completed-bar cutoff filter.
+# A daily candle has no "forming" problem in the cache sense: today's
+# candle IS the current day, and the same day's row gets overwritten
+# on the next fetch. Forcing a forming-bar exclusion on daily would
+# drop today's row entirely (datetime == to_datetime), which is wrong.
+# Per plan §12: "Do not mix mutable forming bars with completed
+# historical bars" -- the intent is intraday bars. Daily is exempt.
+_INTERVALS_EXEMPT_FROM_FORMING_FILTER = frozenset({"day"})
+
+
+def _intraday_cache_gate_evaluate(
+    *,
+    rows: list,
+    to_datetime_str: str,
+    interval: str,
+    interval_mins: int,
+    freshness_seconds: int,
+    include_forming: bool,
+    min_candles: int,
+    source_kind: str,
+    source_id: object,
+) -> tuple | None:
+    """[WORKFLOW-H H4 + H4.B 2026-09-13] Shared HIT-path gate.
+
+    Evaluates the four §12 explicit semantics on a list of raw cache
+    rows and returns either ``None`` (no HIT) or a tuple
+    ``(filtered_rows, debug_event)``. Caller logs the debug event
+    and constructs the DataFrame from filtered_rows.
+
+    The two callers (``get_intraday`` and ``get_intraday_by_token``)
+    share this gate so the four semantics can never drift between
+    the by-symbol and by-token paths.
+
+    Parameters
+    ----------
+    rows
+        Raw rows from a cache table, ordered by datetime ascending.
+        Each row's first column is the ``datetime`` string in the
+        ``"%Y-%m-%d %H:%M:%S"`` format.
+    to_datetime_str
+        The ``to_datetime`` argument the caller passed in.
+    interval
+        The Kite interval name (``"minute"``, ``"5minute"``, ...).
+        Used only for the "exempt from forming filter" check.
+    interval_mins
+        Numeric candle width (1 for "minute", 5 for "5minute", ...).
+    freshness_seconds
+        Operator-tunable leniency budget on the freshness gate.
+        Negative values are clamped to 0.
+    include_forming
+        §12 completed-bar cutoff. ``False`` (default) means forming
+        candles (``datetime >= to_datetime_str``) are EXCLUDED from
+        the returned set. Daily interval is exempt.
+    min_candles
+        Floor on the returned candle count after the forming-bar
+        filter. Below the floor: no HIT.
+    source_kind
+        ``"ticker"`` or ``"instrument_token"``. Logged only.
+    source_id
+        The ticker string or instrument_token int. Logged only.
+
+    Returns
+    -------
+    ``None`` if no HIT. Otherwise ``(filtered_rows, debug_event)``
+    where ``debug_event`` is a dict suitable for
+    ``logger.debug(..., **debug_event)``.
+    """
+    if not rows or len(rows) < min_candles:
+        return None
+    last_cached_dt = datetime.strptime(rows[-1][0], "%Y-%m-%d %H:%M:%S")
+    to_dt_obj = datetime.strptime(to_datetime_str, "%Y-%m-%d %H:%M:%S")
+
+    # Freshness gate: the most recent cached candle must cover up
+    # to ``to_dt_obj - interval_minutes - freshness_seconds``. The
+    # default freshness_seconds=0 matches the strict pre-H4 gate.
+    effective_freshness_seconds = max(0, freshness_seconds)
+    expected_latest = (
+        to_dt_obj
+        - timedelta(minutes=interval_mins)
+        - timedelta(seconds=effective_freshness_seconds)
+    )
+    if last_cached_dt < expected_latest:
+        return None
+
+    # Completed-bar cutoff: drop forming candles unless the operator
+    # has opted in OR the interval is exempt (e.g. daily).
+    if include_forming or interval in _INTERVALS_EXEMPT_FROM_FORMING_FILTER:
+        filtered_rows = list(rows)
+    else:
+        filtered_rows = [
+            r for r in rows
+            if datetime.strptime(r[0], "%Y-%m-%d %H:%M:%S") < to_dt_obj
+        ]
+
+    if not filtered_rows:
+        return (
+            [],
+            dict(
+                event_type="intraday_cache_only_forming",
+                source_kind=source_kind, source_id=source_id,
+                total_rows=len(rows), forming_rows=len(rows),
+            ),
+        )
+    if len(filtered_rows) < min_candles:
+        return (
+            [],
+            dict(
+                event_type="intraday_cache_filtered_below_floor",
+                source_kind=source_kind, source_id=source_id,
+                raw_rows=len(rows), filtered_rows=len(filtered_rows),
+                min_candles=min_candles,
+            ),
+        )
+    return (
+        filtered_rows,
+        dict(
+            event_type="intraday_cache_hit",
+            source_kind=source_kind, source_id=source_id,
+            candles=len(filtered_rows),
+            forming_dropped=len(rows) - len(filtered_rows),
+        ),
+    )
+
+class RateLimiter:
+    def __init__(self, rate: float, burst: int):
+        self.rate = rate
+        self.burst = burst
+        self.tokens = burst
+        self.last_update = time.monotonic()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self):
+        async with self._lock:
+            while True:
+                now = time.monotonic()
+                elapsed = now - self.last_update
+                self.tokens = min(self.burst, self.tokens + elapsed * self.rate)
+                self.last_update = now
+                if self.tokens >= 1:
+                    self.tokens -= 1
+                    return
+                await asyncio.sleep(1 / self.rate)
+
+class KiteClient:
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self.access_token = ""
+        self.token_set_ist_date = None  # [BOOTSTRAP-2026-07-17] see set_token
+        self.limiter = RateLimiter(rate=3.0, burst=1)
+        self.instrument_cache = {}
+        self._cache_lock = asyncio.Lock()
+        # KITE_BASE_URL: direct = "https://api.kite.trade" (default); via OCI relay = "http://161.118.160.180:31527"
+        # Relay is a path-preserving forward proxy. Auth + X-Kite-Version headers pass through unchanged.
+        self.client = httpx.AsyncClient(base_url=settings.KITE_BASE_URL, timeout=15.0)
+
+    def _cache_db(self):
+        """Return a cache connection with a contention-safe bounded wait."""
+        return aiosqlite.connect(
+            self.db_path, timeout=SQLITE_OPERATION_TIMEOUT_SEC,
+        )
+
+    def set_token(self, token: str):
+        self.access_token = token
+        # [BOOTSTRAP-2026-07-17] IST date this token was armed. A non-empty
+        # access_token is NOT proof of freshness: on a day with no restart
+        # the client still holds yesterday's token, expired at the broker
+        # since ~06:00 IST. daily_bootstrap.token_is_fresh_today() compares
+        # this stamp against today; the startup-restore path also goes
+        # through set_token and only ever restores a same-day token.
+        import pytz as _pytz
+        self.token_set_ist_date = datetime.now(
+            _pytz.timezone("Asia/Kolkata")
+        ).date()
+        api_key = os.getenv("ZERODHA_API_KEY", "")
+        self.client.headers.update({
+            "X-Kite-Version": "3",
+            "Authorization": f"token {api_key}:{token}"
+        })
+        # [FIX-PHASE3-AUDIT 2026-07-09] Masked breadcrumb: the armed vs
+        # disarmed transition was previously invisible in the logs.
+        logger.info(
+            "kite_token_set suffix=...%s",
+            token[-4:] if token and len(token) >= 4 else "?",
+        )
+
+    async def _init_db(self):
+        # [PENNY-SQLITE-WAL 2026-07-02] Switch cache.db to WAL mode
+        # + a bounded busy timeout. Today's incident: penny_scanner_once
+        # held a write lock on cache.db while iterating the universe,
+        # and the heartbeat's `health_circuit_query_failed
+        # error=database is locked` fired repeatedly because the
+        # default sqlite3 busy_timeout is 0 (fail-fast). WAL mode
+        # allows concurrent readers + a single writer (vs. the old
+        # rollback-journal mode which serialises everyone). A bounded
+        # 30s busy_timeout gives a bursty scanner writer time to finish
+        # before the caller gives up.
+        async with self._cache_db() as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute(
+                f"PRAGMA busy_timeout={int(SQLITE_OPERATION_TIMEOUT_SEC * 1000)}"
+            )
+            await db.execute("PRAGMA synchronous=NORMAL")
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS ohlcv_cache (
+                    ticker TEXT, date TEXT, open REAL, high REAL, low REAL,
+                    close REAL, volume INTEGER, fetched_at TIMESTAMP,
+                    PRIMARY KEY (ticker, date)
+                )
+            """)
+            await db.commit()
+
+    async def _init_intraday_db(self):
+        # [PENNY-SQLITE-WAL 2026-07-02] Same WAL + busy_timeout
+        # enforcement as _init_db. The two tables share the same
+        # cache.db file so PRAGMA is idempotent here.
+        async with self._cache_db() as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute(
+                f"PRAGMA busy_timeout={int(SQLITE_OPERATION_TIMEOUT_SEC * 1000)}"
+            )
+            await db.execute("PRAGMA synchronous=NORMAL")
+            # [WORKFLOW-H H4.B 2026-09-13] The by-token cache
+            # table is created here alongside the by-symbol one.
+            # F&O candles include an OI column (open interest),
+            # which the by-symbol path does not store. PRIMARY KEY
+            # is (instrument_token, interval, datetime) to match
+            # the by-symbol PRIMARY KEY shape (ticker, interval,
+            # datetime) -- never the two keys mixed.
+            await self._create_intraday_cache_by_token_table(db)
+            # `interval` was absent from the original schema even though this
+            # client stores both one-minute Penny bars and 15-minute Momentum
+            # bars.  The old (ticker, datetime) key allowed one resolution to
+            # overwrite and later masquerade as the other.
+            #
+            # Migrate transactionally and conservatively.  A legacy ticker-day
+            # containing any non-quarter-hour timestamp can only have come from
+            # a one-minute fetch, so that whole coherent fetch is recoverable as
+            # `minute`.  Quarter-hour-only groups are ambiguous and are retained
+            # as `legacy_unknown`; they are deliberately never served for a
+            # known interval, forcing one clean broker refetch rather than using
+            # potentially mislabelled market data.  Re-running this initializer
+            # sees the new column and is a no-op.
+            cursor = await db.execute("PRAGMA table_info(intraday_cache)")
+            columns = [row[1] for row in await cursor.fetchall()]
+            if columns and "interval" in columns:
+                return
+
+            # Only the first initialization/migration needs a writer lock. The
+            # Penny scanner calls this method concurrently for many tickers; a
+            # BEGIN IMMEDIATE on the already-current hot path would serialize
+            # every cache read for no benefit.
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                # Another connection may have completed the migration while we
+                # waited for the lock, so re-check under the transaction.
+                cursor = await db.execute("PRAGMA table_info(intraday_cache)")
+                columns = [row[1] for row in await cursor.fetchall()]
+                if not columns:
+                    await self._create_intraday_cache_table(db)
+                elif "interval" not in columns:
+                    await db.execute(
+                        "ALTER TABLE intraday_cache "
+                        "RENAME TO intraday_cache_pre_interval"
+                    )
+                    await self._create_intraday_cache_table(db)
+                    await db.execute(
+                        """
+                        INSERT OR REPLACE INTO intraday_cache
+                            (ticker, interval, datetime, open, high, low, close,
+                             volume, fetched_at)
+                        SELECT old.ticker,
+                               CASE WHEN EXISTS (
+                                   SELECT 1
+                                   FROM intraday_cache_pre_interval AS probe
+                                   WHERE probe.ticker = old.ticker
+                                     AND substr(probe.datetime, 1, 10) =
+                                         substr(old.datetime, 1, 10)
+                                     AND CAST(substr(probe.datetime, 15, 2) AS INTEGER)
+                                         NOT IN (0, 15, 30, 45)
+                               ) THEN 'minute' ELSE ? END,
+                               old.datetime, old.open, old.high, old.low,
+                               old.close, old.volume, old.fetched_at
+                        FROM intraday_cache_pre_interval AS old
+                        """,
+                        (_LEGACY_INTRADAY_INTERVAL,),
+                    )
+                    await db.execute("DROP TABLE intraday_cache_pre_interval")
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
+
+    @staticmethod
+    async def _create_intraday_cache_table(db) -> None:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS intraday_cache (
+                ticker   TEXT NOT NULL,
+                interval TEXT NOT NULL DEFAULT 'legacy_unknown',
+                datetime TEXT NOT NULL,
+                open     REAL,
+                high     REAL,
+                low      REAL,
+                close    REAL,
+                volume   REAL,
+                fetched_at TIMESTAMP,
+                PRIMARY KEY (ticker, interval, datetime)
+            )
+        """)
+
+    @staticmethod
+    async def _create_intraday_cache_by_token_table(db) -> None:
+        """[WORKFLOW-H H4.B 2026-09-13] The by-token cache table.
+
+        Sibling of ``intraday_cache`` keyed on ``instrument_token``
+        instead of ``ticker``. The two tables NEVER share rows:
+        the by-token path is for NFO/F&O contracts whose symbol
+        cache (``self.instrument_cache``) covers NSE equities only,
+        and the by-symbol path is for cash equity Penny scanners.
+
+        The ``oi`` (open-interest) column is by-token-only because
+        F&O candles include OI; the by-symbol path does not.
+
+        PRIMARY KEY shape mirrors the by-symbol path
+        ``(instrument_token, interval, datetime)`` so §12 four
+        semantics (instrument + interval + completed-bar cutoff +
+        freshness) are honoured on the same gate contract.
+        """
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS intraday_cache_by_token (
+                instrument_token INTEGER NOT NULL,
+                interval         TEXT NOT NULL,
+                datetime         TEXT NOT NULL,
+                open             REAL,
+                high             REAL,
+                low              REAL,
+                close            REAL,
+                volume           REAL,
+                oi               REAL,
+                fetched_at       TIMESTAMP,
+                PRIMARY KEY (instrument_token, interval, datetime)
+            )
+        """)
+
+
+
+
+    async def clear_intraday_cache(self):
+        """Age out intraday candles past the retention window (midnight, IST).
+
+        [INTRADAY-RETENTION 2026-08-04] This used to delete EVERYTHING before
+        yesterday, and that single line is why no intraday strategy in this
+        system has ever been validated.
+
+        The deletion was never needed for correctness. get_intraday() already
+        bounds its read with `datetime >= from AND datetime <= to` and decides
+        freshness from the last candle against `expected_latest`, so stale rows
+        can neither be served nor confuse a scan. The purge was pure disk
+        management -- and it was throwing away the only record of what the
+        market did minute by minute.
+
+        The cost of that: momentum and F&O are intraday strategies whose every
+        parameter (stop floor, R target, time-stop window, entry gates) was
+        tuned on the handful of live trades the operator happened to take,
+        because there was no history to test against. `ohlcv_cache` keeps 2.5
+        years of DAILY bars for 4,668 tickers; intraday kept three days. So
+        the two strategies that trade every day are precisely the two that
+        cannot be backtested, and no amount of parameter work can produce
+        evidence that they will not lose money.
+
+        Retaining it is cheap: measured at 2.53 MB/day (94 B/row, ~29k rows
+        per session), so a full year is ~633 MB against 17 GB free. That is
+        less than the 800 MB of stale cache.db.bak-* files already sitting in
+        /data.
+        """
+        await self._init_intraday_db()
+        from datetime import timedelta
+        import pytz
+        from config import settings
+
+        retention_days = int(getattr(settings, "INTRADAY_RETENTION_DAYS", 365))
+        IST = pytz.timezone("Asia/Kolkata")
+        now_ist = datetime.now(IST)
+        cutoff = (now_ist - timedelta(days=retention_days)).strftime("%Y-%m-%d")
+
+        async with self._cache_db() as db:
+            cur = await db.execute(
+                "DELETE FROM intraday_cache WHERE datetime < ?",
+                (cutoff + " 00:00:00",)
+            )
+            deleted = cur.rowcount
+            await db.commit()
+            async with db.execute(
+                "SELECT COUNT(*), COUNT(DISTINCT substr(datetime,1,10)) "
+                "FROM intraday_cache"
+            ) as c2:
+                remaining, sessions = await c2.fetchone()
+
+        # Log the corpus size, not just the deletion. This is now a research
+        # dataset that grows toward a usable backtest, and "how much history do
+        # we have" is the number that decides when a strategy can be evaluated.
+        logger.info(
+            "intraday_cache_aged_out", cutoff=cutoff, deleted=deleted,
+            rows_retained=remaining, sessions_retained=sessions,
+            retention_days=retention_days,
+        )
+
+
+    async def refresh_instrument_cache(self):
+        if not self.access_token:
+            return
+        async with self._cache_lock:
+            try:
+                # Fetch NSE instruments only -- INDICES segment returns 403 on this plan
+                for segment in ["NSE"]:
+                    resp = await self.client.get(f"/instruments/{segment}")
+                    resp.raise_for_status()
+                    lines = resp.text.split("\n")
+                    if len(lines) > 1:
+                        for line in lines[1:]:
+                            parts = line.split(",")
+                            if len(parts) > 2:
+                                symbol = parts[2].strip('"').upper()
+                                # [INSTRUMENT-CACHE-INT 2026-07-03] Coerce
+                                # to int so downstream callsites can do
+                                # `kite.instrument_cache.get(symbol)`
+                                # and treat the result as a token int.
+                                # Pre-fix: stored the raw CSV cell
+                                # (a string) and penny_scanner's
+                                # `_get_quote_safe(token)` silently
+                                # missed the int-keyed /quote response
+                                # dict, logging `quote_unavailable` for
+                                # 100% of penny tickers even though the
+                                # cache was full.
+                                raw_token = parts[0].strip('"') if parts[0] else ""
+                                try:
+                                    self.instrument_cache[symbol] = int(raw_token)
+                                except ValueError:
+                                    # Malformed row (header line, blank
+                                    # row, partial parse). Skip silently.
+                                    continue
+                logger.info("instruments_refreshed", count=len(self.instrument_cache))
+
+            except (httpx.RequestError, httpx.HTTPStatusError) as e:
+                logger.error("instrument_refresh_failed", error=str(e))
+
+
+    async def get_historical(self, ticker: str, from_date: str, to_date: str) -> pd.DataFrame:
+        await self._init_db()
+        ticker = ticker.upper()
+        
+        # Check Cache
+# Check Cache
+        async with self._cache_db() as db:
+            cursor = await db.execute(
+                "SELECT date, open, high, low, close, volume, fetched_at FROM ohlcv_cache WHERE ticker=? AND date >= ? AND date <= ? ORDER BY date",
+                (ticker, from_date, to_date)
+            )
+            rows = await cursor.fetchall()
+
+            # [DAILY-CACHE-COVERAGE 2026-07-15] The old `len(rows) >= 60` floor
+            # assumed a long (swing / EMA200) window. Momentum requests only
+            # ~30 days (~22 trading rows), so 22 < 60 made EVERY momentum daily
+            # fetch a cache MISS -> ~500 redundant Kite calls per 30-min scan.
+            # That monopolised the 3 req/s limiter and starved the penny scan
+            # (the penny_scan_timeout bursts on 2026-07-15). Gate on window
+            # COVERAGE instead: require ~80% of the trading days the requested
+            # window should contain. A long-window (swing) caller still refuses a
+            # momentum-truncated cache (its expected count is high, so a 22-row
+            # cache misses and it re-fetches), while momentum's short window hits
+            # after the first fetch of the day. Correctness AND load, together.
+            try:
+                _d0 = datetime.strptime(from_date, "%Y-%m-%d")
+                _d1 = datetime.strptime(to_date, "%Y-%m-%d")
+                _expected_td = max(1, int((_d1 - _d0).days * 5 / 7))  # ~trading days
+                _min_rows = max(2, int(_expected_td * 0.8))
+            except (ValueError, TypeError):
+                _min_rows = 60  # malformed dates -> fall back to the old floor
+
+            # [WORKFLOW-C.F3 2026-09-16] F-3 from the 2026-09-16
+            # production audit: 0% cache_hit rate is chronic
+            # (4th consecutive audit). The bounded fix here
+            # is observability -- surface WHICH condition
+            # caused the cache_miss so the audit can answer
+            # "is the writer broken, the freshness window
+            # too short, or the date window off?". The 4
+            # miss reasons are: no_rows, insufficient_rows,
+            # date_window_miss, freshness_exceeded.
+            cache_miss_reason: str | None = None
+
+            if not rows:
+                cache_miss_reason = "no_rows"
+            elif len(rows) < _min_rows:
+                cache_miss_reason = "insufficient_rows"
+            else:
+                last_cached_date = rows[-1][0] # Index 0 is 'date'
+                # [CRIT] FIX: Force a cache miss if the DB doesn't have today's live candle yet!
+                if last_cached_date < to_date:
+                    cache_miss_reason = "date_window_miss"
+                else:
+                    last_fetched_str = rows[-1][6] # fetched_at is index 6
+                    try:
+                        last_fetched = datetime.strptime(last_fetched_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                        age_seconds = (datetime.now(timezone.utc) - last_fetched).total_seconds()
+                        if age_seconds >= 86400:
+                            cache_miss_reason = "freshness_exceeded"
+                        else:
+                            # [LOG-HYGIENE 2026-07-17] debug, not info: the
+                            # 30s penny loop emitted ~55k of these per
+                            # morning -- 53% of all engine log lines -- and
+                            # the volume pushed docker's json-log rotation
+                            # past what `docker logs` can read back.
+                            # Cache MISSES stay at info (they cost quota).
+                            logger.debug("data_fetch", event_type="cache_hit", ticker=ticker)
+                            df = pd.DataFrame(rows, columns=['date', 'open', 'high', 'low', 'close', 'volume', 'fetched_at'])
+                            df.drop(columns=['fetched_at'], inplace=True)
+                            df['date'] = pd.to_datetime(df['date'])
+                            df.set_index('date', inplace=True)
+                            return df
+                    except (ValueError, TypeError) as e:
+                        # [ROADMAP-4.3 2026-07-13] Genuinely benign -- we fall
+                        # through to a live fetch, which is correct. But if the
+                        # cache timestamp format ever drifts, EVERY ticker
+                        # silently becomes a cache miss and the scan starts
+                        # hammering the Kite rate limiter for no visible reason.
+                        cache_miss_reason = "timestamp_parse_failed"
+                        logger.debug("cache_timestamp_parse_failed",
+                                     ticker=ticker, error=str(e))
+
+        # async with aiosqlite.connect(self.db_path) as db:
+        #     cursor = await db.execute(
+        #         "SELECT date, open, high, low, close, volume FROM ohlcv_cache WHERE ticker=? AND date >= ? AND date <= ? ORDER BY date",
+        #         (ticker, from_date, to_date)
+        #     )
+        #     rows = await cursor.fetchall()
+        #     if rows and len(rows) >= 60: 
+        #         logger.info("data_fetch", event_type="cache_hit", ticker=ticker)
+        #         df = pd.DataFrame(rows, columns=['date', 'open', 'high', 'low', 'close', 'volume'])
+        #         df['date'] = pd.to_datetime(df['date'])
+        #         df.set_index('date', inplace=True)
+        #         return df
+
+        # Cache Miss -> API
+        # [WORKFLOW-C.F3 2026-09-16] F-3 observability: include
+        # the cache_miss_reason so the audit can attribute
+        # zero-hit-rate days to one of: no_rows,
+        # insufficient_rows, date_window_miss,
+        # freshness_exceeded, or timestamp_parse_failed.
+        # Without this, "0% hit rate" is unattributable.
+        logger.info(
+            "data_fetch",
+            event_type="cache_miss",
+            ticker=ticker,
+            cache_miss_reason=cache_miss_reason or "unknown",
+        )
+        instrument_token = self.instrument_cache.get(ticker)
+        if not instrument_token:
+            raise ValueError(f"Unknown ticker: {ticker}")
+        
+        for attempt in range(5):
+            await self.limiter.acquire()
+            try:
+                resp = await self.client.get(
+                    f"/instruments/historical/{instrument_token}/day",
+                    params={"from": from_date, "to": to_date}
+                )
+                resp.raise_for_status()
+                data = resp.json().get("data", {}).get("candles", [])
+                if not data:
+                    return pd.DataFrame()
+                
+                df = pd.DataFrame(data, columns=['date', 'open', 'high', 'low', 'close', 'volume'])
+                df['date'] = pd.to_datetime(df['date']).dt.tz_localize(None)
+                
+                # Write to Cache
+                async with self._cache_db() as db:
+                    for _, row in df.iterrows():
+                        await db.execute(
+                            "INSERT OR REPLACE INTO ohlcv_cache (ticker, date, open, high, low, close, volume, fetched_at) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                            (ticker, row['date'].strftime("%Y-%m-%d"), row['open'], row['high'], row['low'], row['close'], row['volume'])
+                        )
+                    await db.commit()
+                
+                df.set_index('date', inplace=True)
+                return df
+
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code in (429, 503, 504):  # 504 = Zerodha gateway timeout, also retried
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                raise
+            except httpx.RequestError:
+                await asyncio.sleep(2 ** attempt)
+                continue
+        
+        logger.error("max_retries_exceeded", ticker=ticker)
+        return pd.DataFrame()
+
+    async def get_intraday(
+        self,
+        ticker: str,
+        from_datetime: str,
+        to_datetime: str,
+        interval: str = "15minute"
+    ) -> pd.DataFrame:
+        """
+        Fetch intraday candles (15-minute default).
+
+        [WORKFLOW-H H4 2026-09-13] Cache semantics per plan section 12:
+        the four explicit invariants -- instrument, interval,
+        completed-bar cutoff, freshness -- are now honoured by
+        the HIT path. The cache still contains forming candles
+        (the writer cannot know when Kite's most recent candle is
+        closed); the HIT path EXCLUDES forming candles when
+        ``settings.INTRADAY_CACHE_INCLUDE_FORMING=False`` (default,
+        per section 12 "do not mix mutable forming bars with
+        completed historical bars").
+
+        Freshness semantics: the most recent cached candle must
+        be no older than ``expected_latest - freshness_seconds``,
+        where ``expected_latest = to_datetime - interval_minutes``.
+        The default ``freshness_seconds=0`` matches the pre-H4
+        strict "last candle covers up to most recent interval
+        boundary" gate.
+
+        Operator-tunable knobs in ``config.py``:
+            INTRADAY_CACHE_FRESHNESS_SECONDS
+            INTRADAY_CACHE_INCLUDE_FORMING
+            INTRADAY_CACHE_MIN_CANDLES
+
+        The 00:05 IST cron ``clear_intraday_cache`` (retention
+        default 365 days) does the daily ageing; the H4 path
+        does NOT change that schedule.
+
+        from_datetime / to_datetime format: "YYYY-MM-DD HH:MM:SS"
+        """
+        from config import settings
+        interval = str(interval or "").strip().lower()
+        interval_mins = _interval_minutes(interval)
+        await self._init_intraday_db()
+        ticker = ticker.upper()
+        # [WORKFLOW-H H4 2026-09-13] Config knobs read ONCE per call;
+        # defaults preserve the pre-H4 strict behaviour.
+        freshness_seconds = int(
+            getattr(settings, "INTRADAY_CACHE_FRESHNESS_SECONDS", 0)
+        )
+        include_forming = bool(
+            getattr(settings, "INTRADAY_CACHE_INCLUDE_FORMING", False)
+        )
+        min_candles = int(
+            getattr(settings, "INTRADAY_CACHE_MIN_CANDLES", 4)
+        )
+
+        # Check cache: only use if all rows are from today
+        async with self._cache_db() as db:
+            cursor = await db.execute(
+                """SELECT datetime, open, high, low, close, volume
+                   FROM intraday_cache
+                   WHERE ticker=? AND interval=?
+                     AND datetime >= ? AND datetime <= ?
+                   ORDER BY datetime""",
+                (ticker, interval, from_datetime, to_datetime)
+            )
+            rows = await cursor.fetchall()
+            # [WORKFLOW-H H4 2026-09-13] Shared gate evaluates the
+            # four §12 explicit semantics. See ``_intraday_cache_gate_evaluate``
+            # for the gate contract.
+            verdict = _intraday_cache_gate_evaluate(
+                rows=rows,
+                to_datetime_str=to_datetime,
+                interval=interval,
+                interval_mins=interval_mins,
+                freshness_seconds=freshness_seconds,
+                include_forming=include_forming,
+                min_candles=min_candles,
+                source_kind="ticker",
+                source_id=ticker,
+            )
+            if verdict is not None:
+                filtered_rows, debug_event = verdict
+                # The gate's debug_event uses ``source_kind`` /
+                # ``source_id`` for the cross-cutting case. The
+                # by-symbol path keeps the legacy ``ticker`` field
+                # name so log-grep operators continue to find it.
+                if "ticker" not in debug_event:
+                    debug_event["ticker"] = ticker
+                if filtered_rows:
+                    logger.debug("data_fetch", **debug_event)
+                    df = pd.DataFrame(
+                        filtered_rows,
+                        columns=['datetime','open','high','low','close','volume'],
+                    )
+                    df['datetime'] = pd.to_datetime(df['datetime'])
+                    df.set_index('datetime', inplace=True)
+                    return df
+                # No HIT (only-forming or below-floor). Fall through.
+                logger.debug("data_fetch", **debug_event)
+            else:
+                # Stale: gate rejected on freshness. Differentiate
+                # this from a true miss so operators can distinguish
+                # "cache out of date" from "cache empty".
+                last_cached_dt = (
+                    datetime.strptime(rows[-1][0], "%Y-%m-%d %H:%M:%S")
+                    if rows else None
+                )
+                expected_latest = (
+                    datetime.strptime(to_datetime, "%Y-%m-%d %H:%M:%S")
+                    - timedelta(minutes=interval_mins)
+                    - timedelta(seconds=max(0, freshness_seconds))
+                )
+                logger.debug(
+                    "data_fetch",
+                    event_type="intraday_cache_stale",
+                    ticker=ticker,
+                    last_candle=str(last_cached_dt) if last_cached_dt else None,
+                    expected=str(expected_latest),
+                )
+
+        # Cache miss -> API
+        logger.debug("data_fetch", event_type="intraday_cache_miss", ticker=ticker)
+        instrument_token = self.instrument_cache.get(ticker)
+        if not instrument_token:
+            raise ValueError(f"Unknown ticker: {ticker}")
+
+        for attempt in range(5):
+            await self.limiter.acquire()
+            try:
+                resp = await self.client.get(
+                    f"/instruments/historical/{instrument_token}/{interval}",
+                    params={"from": from_datetime, "to": to_datetime}
+                )
+                resp.raise_for_status()
+                data = resp.json().get("data", {}).get("candles", [])
+                if not data:
+                    return pd.DataFrame()
+
+                df = pd.DataFrame(
+                    data, columns=['datetime','open','high','low','close','volume']
+                )
+                df['datetime'] = pd.to_datetime(df['datetime']).dt.tz_localize(None)
+
+                # Write to intraday cache
+                async with self._cache_db() as db:
+                    for _, row in df.iterrows():
+                        await db.execute(
+                            """INSERT OR REPLACE INTO intraday_cache
+                               (ticker, interval, datetime, open, high, low, close,
+                                volume, fetched_at)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
+                            (ticker,
+                             interval,
+                             row['datetime'].strftime("%Y-%m-%d %H:%M:%S"),
+                             row['open'], row['high'], row['low'],
+                             row['close'], row['volume'])
+                        )
+                    await db.commit()
+
+                df.set_index('datetime', inplace=True)
+                return df
+
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code in (429, 503, 504):  # 504 = Zerodha gateway timeout, also retried
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                raise
+            except httpx.RequestError:
+                await asyncio.sleep(2 ** attempt)
+                continue
+
+        logger.error("max_retries_exceeded_intraday", ticker=ticker)
+        return pd.DataFrame()
+
+    # ---- 2026-06-22 deviation: 6 methods added that the penny code calls ----
+    # See docs/deviations/2026-06-22-kite-client-methods-deviation.md
+    # Standard Zerodha Kite Connect API endpoints.
+
+    # [AUDIT-FIX-2.3] Module-level latch so we only emit the CRITICAL
+    # log once per process. Reset on a successful batch to surface
+    # new failure modes (e.g. auth was working, then expired).
+    _quote_batch_fail_emitted: bool = False
+
+    async def get_quote(self, tokens) -> dict:
+        """Fetch live quote for one or more instrument tokens.
+        Kite endpoint: GET /quote?i={token1}&i={token2}...
+        Returns: dict {token_int: {last_price, ohlc, volume, depth, ...}, ...}
+
+        [AUDIT-FIX-2.3 2026-06-25] Whole-batch failures are now loud.
+        When the Kite call returns ZERO quotes but the caller asked for
+        N>0 tokens, that's a "full batch failure" -- something's wrong
+        with the connection/auth/rate-limit. Pre-fix we only logged
+        at WARNING per call, which was lost in noise when scanning 100
+        tickers. Now the FIRST full-batch failure per process emits a
+        CRITICAL log so the operator sees it. Subsequent failures log
+        at WARNING (not CRITICAL) to avoid spam.
+
+        [KITE-QUOTE-RETRY 2026-07-02] Wraps the underlying call with
+        exponential-backoff retry on 401/403/429/5xx. Today's incident:
+        2,649 kite_quote_failed status=403 events between 09:00-10:30
+        IST, every single one an immediate failure with no retry.
+        Most 403s from Kite during market open are transient (token
+        re-auth mid-session, momentary overload); a single retry with
+        0.5s backoff recovers the vast majority. After 3 attempts the
+        call is given up and logged at WARNING. Also emits a
+        kite_auth_degraded WARNING once when the per-minute failure
+        rate exceeds 30 (today hit ~600/min at the peak).
+        """
+        if isinstance(tokens, (int, str)):
+            tokens = [tokens]
+        if not tokens:
+            return {}
+        tokens = [int(t) for t in tokens]
+
+        # Retry config (KITE-QUOTE-RETRY 2026-07-02): 3 attempts,
+        # 0.5s -> 1.0s -> 2.0s backoff. Total worst-case wait ~3.5s,
+        # which is fine because the penny scanner runs on a 30s cron.
+        max_attempts = 3
+        backoff = 0.5
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, max_attempts + 1):
+            await self.limiter.acquire()
+            try:
+                resp = await self.client.get(
+                    "/quote",
+                    params=[("i", str(t)) for t in tokens],
+                )
+                resp.raise_for_status()
+                data = resp.json().get("data", {})
+                result = {int(k): v for k, v in data.items()}
+                if not result and tokens:
+                    # [KITE-QUOTE-RETRY] Empty body with 200 OK -- this
+                    # is the case today's 2,649 403s turned into. Treat
+                    # as transient and retry unless we're on the last
+                    # attempt. If still empty after retries, fall through
+                    # to the existing failure logger.
+                    if attempt < max_attempts:
+                        logger.warning(
+                            "kite_quote_empty_body_retrying attempt=%d/%d tokens=%d",
+                            attempt, max_attempts, len(tokens),
+                        )
+                        await asyncio.sleep(backoff)
+                        backoff *= 2
+                        continue
+                    self._log_quote_batch_failure(len(tokens))
+                    self._note_quote_rate_failure()
+                elif result:
+                    self._note_quote_batch_success()
+                return result
+            except httpx.HTTPStatusError as e:
+                last_exc = e
+                status = e.response.status_code
+                # Retry on 401 (token expired), 403 (rate-limit /
+                # momentary overload), 429 (explicit rate-limit), and
+                # any 5xx server error.
+                if status in (401, 403, 429) or status >= 500:
+                    if attempt < max_attempts:
+                        logger.warning(
+                            "kite_quote_http_retry status=%d attempt=%d/%d tokens=%d",
+                            status, attempt, max_attempts, len(tokens),
+                        )
+                        await asyncio.sleep(backoff)
+                        backoff *= 2
+                        continue
+                # [FIX-PHASE3-AUDIT 2026-07-09] Kite returns HTTP 400
+                # InputException "Invalid api_key or access_token" for a
+                # missing/expired token -- NOT 401/403. On 2026-07-09 this
+                # produced 26,311 unexplained status=400 lines. Surface
+                # the likely cause so the operator doesn't hunt elsewhere.
+                if status == 400:
+                    logger.error(
+                        "kite_quote_failed status=400 tokens=%d "
+                        "hint=likely_invalid_or_missing_access_token "
+                        "FIX=log in via Telegram /login (Zerodha token expires daily)",
+                        len(tokens),
+                    )
+                    # [ROADMAP-2.1 2026-07-12] Page the operator too --
+                    # deduped to once/hour inside the helper.
+                    self._maybe_alert_invalid_token()
+                else:
+                    logger.error(
+                        "kite_quote_failed status=%d tokens=%d",
+                        status, len(tokens),
+                    )
+                self._log_quote_batch_failure(len(tokens))
+                self._note_quote_rate_failure()
+                return {}
+            except httpx.RequestError as e:
+                last_exc = e
+                if attempt < max_attempts:
+                    logger.warning(
+                        "kite_quote_request_retry attempt=%d/%d tokens=%d err=%s",
+                        attempt, max_attempts, len(tokens), str(e),
+                    )
+                    await asyncio.sleep(backoff)
+                    backoff *= 2
+                    continue
+                logger.error(
+                    "kite_quote_failed error=%s", str(e),
+                )
+                self._log_quote_batch_failure(len(tokens))
+                self._note_quote_rate_failure()
+                return {}
+        # Should be unreachable given the loops above, but be defensive.
+        if last_exc is not None:
+            logger.error("kite_quote_failed_unreachable %s", str(last_exc))
+        return {}
+
+    async def get_quote_by_instruments(self, instruments: dict[int, str]) -> dict:
+        """Documented Kite full-quote lookup keyed by ``EXCHANGE:SYMBOL``.
+
+        Existing consumers deliberately retain ``get_quote(tokens)`` for
+        backwards compatibility.  New F&O research must not assume that a
+        numeric token is accepted by the documented full-quote endpoint: it
+        supplies the dated exchange/symbol identity and maps returned packets
+        back to the caller's token only after checking the requested key.
+        """
+        requested = {int(token): str(key) for token, key in instruments.items() if str(key).strip()}
+        if not requested:
+            return {}
+        await self.limiter.acquire()
+        try:
+            response = await self.client.get("/quote", params=[("i", key) for key in requested.values()])
+            response.raise_for_status()
+            payload = response.json().get("data", {})
+            reverse = {key: token for token, key in requested.items()}
+            result = {reverse[key]: value for key, value in payload.items() if key in reverse and isinstance(value, dict)}
+            if len(result) != len(requested):
+                logger.warning("kite_quote_instrument_partial requested=%d returned=%d", len(requested), len(result))
+            return result
+        except (httpx.HTTPStatusError, httpx.RequestError) as exc:
+            logger.warning("kite_quote_instrument_failed requested=%d err=%s", len(requested), str(exc))
+            return {}
+
+    def _log_quote_batch_failure(self, n_tokens: int):
+        """[AUDIT-FIX-2.3] Log a full-batch quote failure once at
+        CRITICAL level, then at WARNING. Resets to CRITICAL after a
+        successful batch (so a new failure mode -- e.g. token expiry --
+        is loud again)."""
+        if not KiteClient._quote_batch_fail_emitted:
+            logger.critical(
+                "kite_quote_batch_total_failure "
+                "tokens_requested=%d tokens_returned=0 "
+                "first_failure_in_process=True",
+                n_tokens,
+            )
+            KiteClient._quote_batch_fail_emitted = True
+        else:
+            logger.warning(
+                "kite_quote_batch_total_failure tokens_requested=%d",
+                n_tokens,
+            )
+
+    def _note_quote_batch_success(self):
+        """[AUDIT-FIX-2.3] Called on any non-empty successful batch.
+        Resets the latch so the next full-batch failure is loud again."""
+        if KiteClient._quote_batch_fail_emitted:
+            logger.info(
+                "kite_quote_batch_recovered "
+                "next_batch_failure_will_be_critical_again",
+            )
+            KiteClient._quote_batch_fail_emitted = False
+
+    # [KITE-QUOTE-RETRY 2026-07-02] Per-minute failure counter that
+    # emits a single kite_auth_degraded WARNING once per minute when
+    # the failure rate exceeds the threshold. Today (2026-07-02) the
+    # peak was ~600 failures/min between 09:00-10:30 IST; without
+    # this latch the operator's log buffer fills with thousands of
+    # "kite_quote_failed" ERROR lines and the actual signal (auth is
+    # degraded) is invisible.
+    #
+    # Class-level state so the latch is shared across instances
+    # (defensive -- the codebase only constructs one KiteClient, but
+    # a future test fixture might construct more).
+    _quote_fail_window_start: float = 0.0
+    _quote_fail_window_count: int = 0
+    _quote_fail_degraded_emitted: bool = False
+    KITE_QUOTE_FAIL_RATE_THRESHOLD_PER_MIN = 30
+
+    # [ROADMAP-2.1 2026-07-12] Operator alarm for the invalid/expired-token
+    # signature (HTTP 400 InputException). On 2026-07-09 this failure mode
+    # produced 26,311 log lines but zero Telegram messages -- the operator
+    # found out from the day report. `None` sentinel (not 0.0) because
+    # time.monotonic() can be < the dedupe window right after host boot.
+    _invalid_token_alert_last_monotonic: Optional[float] = None
+    INVALID_TOKEN_ALERT_MIN_INTERVAL_SEC = 3600.0
+
+    def _maybe_alert_invalid_token(self):
+        """Fire-and-forget Telegram alert (via node-gateway /api/internal/
+        notify) when quote calls start failing with the HTTP-400
+        invalid-token signature. Deduped to once per hour so a 400 storm
+        produces ONE page, not thousands. Never raises and never blocks
+        the caller's error path."""
+        now = time.monotonic()
+        last = KiteClient._invalid_token_alert_last_monotonic
+        if last is not None and (now - last) < KiteClient.INVALID_TOKEN_ALERT_MIN_INTERVAL_SEC:
+            return
+        KiteClient._invalid_token_alert_last_monotonic = now
+
+        async def _send():
+            try:
+                async with httpx.AsyncClient() as client:
+                    await client.post(
+                        f"{settings.CONTAINER_A_URL}/api/internal/notify",
+                        json={"message": (
+                            "🔑 KITE TOKEN INVALID/EXPIRED\n"
+                            "Quote calls are failing with HTTP 400 InputException "
+                            "(Zerodha's signature for a missing/expired access token).\n"
+                            "All scans are blind until you log in again via the "
+                            "/login link. Tokens expire daily ~06:00 IST."
+                        )},
+                        headers={"X-Internal-Secret": settings.INTERNAL_API_SECRET or ""},
+                        timeout=5.0,
+                    )
+            except Exception as e:
+                logger.warning("invalid_token_alert_failed error=%s", str(e))
+
+        try:
+            asyncio.get_running_loop()
+            asyncio.create_task(_send())
+        except RuntimeError:
+            # No running loop (sync/test context) -- the ERROR log above
+            # already carries the hint; skip the Telegram hop.
+            pass
+
+    def _note_quote_rate_failure(self) -> None:
+        """[KITE-QUOTE-RETRY 2026-07-02] Track per-minute quote
+        failure rate and emit a single kite_auth_degraded WARNING
+        once per rolling minute when the rate exceeds
+        KITE_QUOTE_FAIL_RATE_THRESHOLD_PER_MIN (default 30). Resets
+        after 60s of no failures OR when _note_quote_batch_success
+        fires.
+        """
+        now = time.monotonic()
+        if (now - KiteClient._quote_fail_window_start) > 60.0:
+            KiteClient._quote_fail_window_start = now
+            KiteClient._quote_fail_window_count = 0
+            KiteClient._quote_fail_degraded_emitted = False
+        KiteClient._quote_fail_window_count += 1
+        if (
+            not KiteClient._quote_fail_degraded_emitted
+            and KiteClient._quote_fail_window_count
+            >= KiteClient.KITE_QUOTE_FAIL_RATE_THRESHOLD_PER_MIN
+        ):
+            # [FIX-PHASE3-AUDIT 2026-07-09] Message previously said
+            # "401/403/5xx" -- but a missing/expired token surfaces as
+            # HTTP 400 InputException, which sent the operator hunting in
+            # the wrong direction on 2026-07-09.
+            logger.warning(
+                "kite_auth_degraded failures_in_last_min=%d "
+                "threshold=%d -- Kite quote calls are failing "
+                "(HTTP 400 usually means invalid/missing access_token: "
+                "log in via Telegram; 401/403/5xx are transient and retried); "
+                "signals may be delayed until auth recovers",
+                KiteClient._quote_fail_window_count,
+                KiteClient.KITE_QUOTE_FAIL_RATE_THRESHOLD_PER_MIN,
+            )
+            KiteClient._quote_fail_degraded_emitted = True
+
+    async def get_instruments_nse_eq(self) -> list:
+        """
+        Fetch the full NSE equity instruments list.
+        Kite endpoint: GET /instruments/NSE (returns CSV)
+        Also refreshes self.instrument_cache (symbol -> token).
+        """
+        await self.limiter.acquire()
+        try:
+            resp = await self.client.get("/instruments/NSE")
+            resp.raise_for_status()
+            lines = resp.text.strip().split("\n")
+            if len(lines) < 2:
+                return []
+            headers = lines[0].split(",")
+            out = []
+            async with self._cache_lock:
+                for line in lines[1:]:
+                    parts = line.split(",")
+                    if len(parts) < len(headers):
+                        continue
+                    rec = dict(zip(headers, parts))
+                    try:
+                        token = int(rec.get("instrument_token", "0"))
+                    except ValueError:
+                        continue
+                    sym = rec.get("tradingsymbol", "").strip().upper()
+                    if rec.get("segment") == "NSE" and rec.get("instrument_type") == "EQ":
+                        out.append({
+                            "instrument_token": token,
+                            "tradingsymbol": sym,
+                            "exchange": rec.get("exchange", "NSE"),
+                            "segment": rec.get("segment"),
+                            "instrument_type": rec.get("instrument_type"),
+                            "name": rec.get("name", ""),
+                            "tick_size": float(rec.get("tick_size", "0.05") or "0.05"),
+                            "lot_size": int(rec.get("lot_size", "1") or "1"),
+                            "series": rec.get("instrument_type", "EQ"),
+                        })
+                        if sym:
+                            self.instrument_cache[sym] = token
+            logger.info("instruments_nse_eq_loaded count=%d", len(out))
+            return out
+        except httpx.HTTPStatusError as e:
+            logger.error("kite_instruments_failed status=%d", e.response.status_code)
+            return []
+        except httpx.RequestError as e:
+            logger.error("kite_instruments_failed error=%s", str(e))
+            return []
+
+    async def get_instruments_dump(self, segment: str) -> str:
+        """
+        [FNO 2026-07-10] Fetch a raw instruments CSV dump for any exchange
+        segment (e.g. "NFO"). Returns "" on failure -- callers own the
+        parse. Deliberately does NOT touch self.instrument_cache: pouring
+        60-90k NFO rows into the flat NSE-equity symbol->token dict would
+        collide with equity symbols and inflate a cache that already takes
+        ~38 min to fill cold (spec §6.1, ops rule 61). fno_instruments
+        keeps its own keyed structure instead.
+        """
+        if not self.access_token:
+            logger.warning("kite_instruments_dump_skip segment=%s reason=no_access_token", segment)
+            return ""
+        await self.limiter.acquire()
+        try:
+            resp = await self.client.get(f"/instruments/{segment}")
+            resp.raise_for_status()
+            return resp.text
+        except httpx.HTTPStatusError as e:
+            # VERIFY-6: this plan 403s the INDICES segment; if NFO also
+            # 403s the whole F&O module is dead in the water -- be loud.
+            logger.error(
+                "kite_instruments_dump_failed segment=%s status=%d "
+                "FIX=if 403, the Kite plan may not include %s -- F&O module "
+                "cannot run without it",
+                segment, e.response.status_code, segment,
+            )
+            return ""
+        except httpx.RequestError as e:
+            logger.error("kite_instruments_dump_failed segment=%s error=%s", segment, str(e))
+            return ""
+
+    async def get_intraday_by_token(
+        self,
+        instrument_token: int,
+        from_datetime: str,
+        to_datetime: str,
+        interval: str = "5minute",
+    ) -> pd.DataFrame:
+        """
+        [WORKFLOW-H H4.B 2026-09-13] Intraday candles by raw
+        instrument token, with §12 cache semantics. The four
+        explicit invariants -- instrument, interval, completed-bar
+        cutoff, freshness -- are honoured by the same HIT-path
+        gate as ``get_intraday`` (see ``_intraday_cache_gate_evaluate``).
+        The previous "no sqlite caching" rationale ("F&O ticks
+        re-read every 5 minutes, so a cache would only serve
+        stale bars") is replaced by the forming-bar filter:
+        forming candles are EXCLUDED from the HIT path, so a
+        cache HIT serves strictly completed candles.
+
+        The ``oi`` (open-interest) column is preserved through
+        the HIT path -- it is part of the Kite F&O candle schema
+        and downstream callers (``partner_orchestrator.realized_vol_20d``)
+        read it.
+
+        Failure contract: returns an empty DataFrame on cache
+        MISS + API failure (preserves pre-H4 behaviour). The
+        5-attempt retry loop is preserved.
+
+        from_datetime / to_datetime format: "YYYY-MM-DD HH:MM:SS"
+        """
+        from config import settings
+        interval = str(interval or "").strip().lower()
+        interval_mins = _interval_minutes(interval)
+        await self._init_intraday_db()
+        # [WORKFLOW-H H4.B 2026-09-13] Same three knobs as the
+        # by-symbol path, read once per call. Defaults preserve
+        # the pre-H4 strict behaviour.
+        freshness_seconds = int(
+            getattr(settings, "INTRADAY_CACHE_FRESHNESS_SECONDS", 0)
+        )
+        include_forming = bool(
+            getattr(settings, "INTRADAY_CACHE_INCLUDE_FORMING", False)
+        )
+        min_candles = int(
+            getattr(settings, "INTRADAY_CACHE_MIN_CANDLES", 4)
+        )
+
+        # Check cache: HIT path. The by-token table has an
+        # additional ``oi`` column (F&O open interest) that the
+        # by-symbol path does not store.
+        async with self._cache_db() as db:
+            cursor = await db.execute(
+                """SELECT datetime, open, high, low, close, volume, oi
+                   FROM intraday_cache_by_token
+                   WHERE instrument_token=? AND interval=?
+                     AND datetime >= ? AND datetime <= ?
+                   ORDER BY datetime""",
+                (int(instrument_token), interval, from_datetime, to_datetime)
+            )
+            rows = await cursor.fetchall()
+            verdict = _intraday_cache_gate_evaluate(
+                rows=rows,
+                to_datetime_str=to_datetime,
+                interval=interval,
+                interval_mins=interval_mins,
+                freshness_seconds=freshness_seconds,
+                include_forming=include_forming,
+                min_candles=min_candles,
+                source_kind="instrument_token",
+                source_id=int(instrument_token),
+            )
+            if verdict is not None:
+                filtered_rows, debug_event = verdict
+                if "instrument_token" not in debug_event:
+                    debug_event["instrument_token"] = int(instrument_token)
+                if filtered_rows:
+                    logger.debug("data_fetch", **debug_event)
+                    cols = ['datetime','open','high','low','close','volume','oi']
+                    df = pd.DataFrame(filtered_rows, columns=cols)
+                    df['datetime'] = pd.to_datetime(df['datetime'])
+                    df.set_index('datetime', inplace=True)
+                    return df
+                # No HIT (only-forming or below-floor). Fall through.
+                logger.debug("data_fetch", **debug_event)
+            else:
+                # Stale: gate rejected on freshness. The by-token
+                # path logs ``instrument_token`` instead of
+                # ``ticker`` -- operators grep differently for the
+                # two paths.
+                last_cached_dt = (
+                    datetime.strptime(rows[-1][0], "%Y-%m-%d %H:%M:%S")
+                    if rows else None
+                )
+                expected_latest = (
+                    datetime.strptime(to_datetime, "%Y-%m-%d %H:%M:%S")
+                    - timedelta(minutes=interval_mins)
+                    - timedelta(seconds=max(0, freshness_seconds))
+                )
+                logger.debug(
+                    "data_fetch",
+                    event_type="intraday_cache_stale",
+                    instrument_token=int(instrument_token),
+                    last_candle=str(last_cached_dt) if last_cached_dt else None,
+                    expected=str(expected_latest),
+                )
+
+        # Cache MISS -> API. Retry loop preserved from the pre-H4.B
+        # implementation; on success, INSERT OR REPLACE the rows
+        # into ``intraday_cache_by_token`` for future HITs.
+        logger.debug(
+            "data_fetch", event_type="intraday_cache_miss",
+            instrument_token=int(instrument_token),
+        )
+        for attempt in range(5):
+            await self.limiter.acquire()
+            try:
+                resp = await self.client.get(
+                    f"/instruments/historical/{int(instrument_token)}/{interval}",
+                    params={"from": from_datetime, "to": to_datetime},
+                )
+                resp.raise_for_status()
+                data = resp.json().get("data", {}).get("candles", [])
+                if not data:
+                    return pd.DataFrame()
+                # Kite appends an OI column for derivatives candles, so the
+                # row width must be checked BEFORE constructing the frame.
+                cols = ['datetime', 'open', 'high', 'low', 'close', 'volume']
+                if len(data[0]) > 6:
+                    cols = cols + ['oi']
+                df = pd.DataFrame(data, columns=cols)
+                df['datetime'] = pd.to_datetime(df['datetime']).dt.tz_localize(None)
+
+                # [WORKFLOW-H H4.B 2026-09-13] Write-through to
+                # the by-token cache. INSERT OR REPLACE on the
+                # PRIMARY KEY (instrument_token, interval,
+                # datetime) ensures idempotency on retry.
+                async with self._cache_db() as db:
+                    for _, row in df.iterrows():
+                        oi_value = (
+                            float(row['oi']) if 'oi' in row and row['oi'] is not None
+                            and not (isinstance(row['oi'], float)
+                                     and (row['oi'] != row['oi']))  # NaN check
+                            else None
+                        )
+                        await db.execute(
+                            """INSERT OR REPLACE INTO intraday_cache_by_token
+                               (instrument_token, interval, datetime, open, high,
+                                low, close, volume, oi, fetched_at)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
+                            (
+                                int(instrument_token),
+                                interval,
+                                row['datetime'].strftime("%Y-%m-%d %H:%M:%S"),
+                                row['open'], row['high'], row['low'],
+                                row['close'], row['volume'], oi_value,
+                            ),
+                        )
+                    await db.commit()
+
+                df.set_index('datetime', inplace=True)
+                return df
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code in (429, 503, 504):
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                logger.error(
+                    "kite_intraday_by_token_failed token=%d status=%d",
+                    instrument_token, e.response.status_code,
+                )
+                return pd.DataFrame()
+            except httpx.RequestError:
+                await asyncio.sleep(2 ** attempt)
+                continue
+        logger.error("max_retries_exceeded_intraday_token token=%d", instrument_token)
+        return pd.DataFrame()
+
+    async def get_corporate_actions(self) -> list:
+        """
+        Kite Connect does not expose corporate actions via a public endpoint.
+        Returns an empty list. Callers (penny_universe.refresh_from_kite) fall
+        back to reading from a local penny_company_data.json file per spec §2.4.
+        """
+        return []
+
+    async def place_order(
+        self,
+        variety: str = "regular",
+        exchange: str = "NSE",
+        tradingsymbol: str = "",
+        transaction_type: str = "BUY",
+        quantity: int = 0,
+        product: str = "MIS",
+        order_type: str = "MARKET",
+        price: float = None,
+        trigger_price: float = None,
+        validity: str = "DAY",
+        tag: str = None,
+        *,
+        intent: str,
+        channel: Optional[str] = None,
+    ) -> dict:
+        """
+        Place an order on Kite.
+        Kite endpoint: POST /orders/{variety}
+        Returns: {order_id, status, message}
+
+        `intent` is REQUIRED and keyword-only, and it is the halt boundary.
+
+        [HALT 2026-08-05] The kill switch blocks ENTRIES and never blocks
+        EXITS. Refusing an exit during a halt would strand a live position with
+        no protective stop -- strictly worse than whatever condition tripped the
+        halt in the first place. So `intent="entry"` is gated and
+        `intent="exit"` always proceeds.
+
+        There is deliberately no default. A default would let a future call site
+        inherit the wrong side of that boundary silently, and both directions of
+        that mistake are expensive: a forgotten exit gets blocked and goes
+        naked, a forgotten entry trades straight through a halt. Making it
+        required converts either mistake into an immediate TypeError.
+        """
+        if intent not in ("entry", "exit"):
+            raise ValueError(f"intent must be 'entry' or 'exit', got {intent!r}")
+
+        if not tradingsymbol or quantity <= 0:
+            return {"order_id": None, "status": "ERROR",
+                    "message": "tradingsymbol and positive quantity are required"}
+
+        def entry_blocker():
+            if intent != "entry":
+                return None
+            owner_halt = is_owner_entry_halted(channel)
+            if not owner_halt.allowed:
+                logger.error(
+                    "kite_order_blocked_by_owner_entry_halt",
+                    tradingsymbol=tradingsymbol,
+                    channel=channel,
+                    reason=owner_halt.reason,
+                )
+                return {
+                    "order_id": None,
+                    "status": "ERROR",
+                    "halted": True,
+                    "owner_entry_halted": True,
+                    "message": f"Owner entry halt: {owner_halt.reason}",
+                }
+            try:
+                assert_not_halted(channel)
+            except TradingHalted as exc:
+                logger.error(
+                    "kite_order_blocked_by_halt",
+                    tradingsymbol=tradingsymbol, channel=channel,
+                    scope=exc.attribution.get("scope"),
+                    by=exc.attribution.get("by"),
+                    reason=exc.attribution.get("reason"),
+                )
+                # Status is "ERROR", not a novel "HALTED": every caller already
+                # branches on ERROR / falsy order_id, and inventing a status
+                # string they do not know would read as SUCCESS. The `halted`
+                # flag is there for callers that want to tell the two apart.
+                return {"order_id": None, "status": "ERROR", "halted": True,
+                        "message": str(exc)}
+            return None
+
+        blocked = entry_blocker()
+        if blocked is not None:
+            return blocked
+        params = {
+            "exchange": exchange,
+            "tradingsymbol": tradingsymbol.upper(),
+            "transaction_type": transaction_type,
+            "quantity": int(quantity),
+            "product": product,
+            "order_type": order_type,
+            "validity": validity,
+        }
+        if price is not None:
+            params["price"] = float(price)
+        if trigger_price is not None:
+            params["trigger_price"] = float(trigger_price)
+        if tag:
+            params["tag"] = tag
+
+        await self.limiter.acquire()
+        # The limiter can yield while an operator trips either entry halt.
+        # Recheck at dispatch; exits never consult either halt predicate.
+        blocked = entry_blocker()
+        if blocked is not None:
+            return blocked
+        try:
+            resp = await self.client.post(f"/orders/{variety}", data=params)
+            resp.raise_for_status()
+            data = resp.json().get("data", {})
+            # An accepted POST is the only honest proof available that this
+            # token + route + static IP may place orders.
+            if data.get("order_id"):
+                mark_order_execution_authorized()
+            return {
+                "order_id": data.get("order_id"),
+                "status": "PLACED",
+                "message": "order placed",
+            }
+        except httpx.HTTPStatusError as e:
+            body = e.response.text[:300] if e.response.text else ""
+            logger.error("kite_place_order_failed status=%d body=%s", e.response.status_code, body)
+            if is_permission_or_static_ip_rejection(e.response.status_code, body):
+                reason = (
+                    f"Kite order authorization rejected via {settings.KITE_BASE_URL}: "
+                    f"HTTP {e.response.status_code}; verify the app's registered static IP "
+                    "and the configured relay egress"
+                )
+                first_transition = mark_order_execution_blocked(
+                    reason, http_status=e.response.status_code,
+                )
+                # Account/route permission affects every live strategy, so this
+                # is intentionally global.  Exits remain exempt at the broker
+                # boundary and will continue to be attempted and reconciled.
+                try:
+                    trip_halt(reason, by="kite_order_authorization")
+                except OSError as halt_exc:
+                    logger.critical(
+                        "kite_order_authorization_halt_failed", error=str(halt_exc),
+                    )
+                if first_transition:
+                    try:
+                        from operator_alert import notify_operator
+                        await notify_operator(
+                            "🔴 LIVE ORDER AUTHORIZATION BLOCKED\n\n"
+                            f"{reason}. New live entries are halted. Existing exits will "
+                            "still be attempted, but manage open positions in Kite until "
+                            "a real order is accepted and the halt is manually cleared.",
+                            event="kite_order_authorization_blocked",
+                        )
+                    except Exception as alert_exc:
+                        logger.error(
+                            "kite_order_authorization_alert_failed", error=str(alert_exc),
+                        )
+            return {"order_id": None, "status": "ERROR",
+                    "execution_blocked": is_permission_or_static_ip_rejection(
+                        e.response.status_code, body
+                    ),
+                    "message": f"HTTP {e.response.status_code}: {body}"}
+        except httpx.RequestError as e:
+            logger.error("kite_place_order_failed error=%s", str(e))
+            return {"order_id": None, "status": "ERROR", "message": str(e)}
+
+    async def modify_order(
+        self,
+        order_id: str,
+        variety: str = "regular",
+        quantity: int = None,
+        price: float = None,
+        trigger_price: float = None,
+        order_type: str = None,
+    ) -> dict:
+        """
+        Modify a pending order in place.
+        Kite endpoint: PUT /orders/{variety}/{order_id}
+        Returns: {order_id, status}
+
+        [TIER0-0.1 2026-07-14] Needed to ratchet the trigger on a resting SL-M as
+        the trail moves. Modifying beats cancel-then-replace: a cancel/place pair
+        leaves the position momentarily unprotected, and if the place leg fails we
+        are naked with no stop at all.
+        """
+        if not order_id:
+            return {"order_id": None, "status": "ERROR", "message": "order_id required"}
+        params = {}
+        if quantity is not None:
+            params["quantity"] = int(quantity)
+        if price is not None:
+            params["price"] = float(price)
+        if trigger_price is not None:
+            params["trigger_price"] = float(trigger_price)
+        if order_type is not None:
+            params["order_type"] = order_type
+        if not params:
+            return {"order_id": order_id, "status": "ERROR", "message": "nothing to modify"}
+
+        await self.limiter.acquire()
+        try:
+            resp = await self.client.put(f"/orders/{variety}/{order_id}", data=params)
+            resp.raise_for_status()
+            data = resp.json().get("data", {})
+            return {"order_id": data.get("order_id", order_id), "status": "MODIFIED"}
+        except httpx.HTTPStatusError as e:
+            body = e.response.text[:300] if e.response.text else ""
+            logger.error("kite_modify_order_failed status=%d order_id=%s body=%s",
+                         e.response.status_code, order_id, body)
+            return {"order_id": order_id, "status": "ERROR",
+                    "message": f"HTTP {e.response.status_code}: {body}"}
+        except httpx.RequestError as e:
+            logger.error("kite_modify_order_failed error=%s", str(e))
+            return {"order_id": order_id, "status": "ERROR", "message": str(e)}
+
+    async def cancel_order(self, order_id: str, variety: str = "regular") -> dict:
+        """
+        Cancel a pending order.
+        Kite endpoint: DELETE /orders/{variety}/{order_id}
+        Returns: {order_id, status}
+        """
+        if not order_id:
+            return {"order_id": None, "status": "ERROR", "message": "order_id required"}
+        await self.limiter.acquire()
+        try:
+            resp = await self.client.delete(f"/orders/{variety}/{order_id}")
+            resp.raise_for_status()
+            data = resp.json().get("data", {})
+            return {"order_id": data.get("order_id", order_id), "status": "CANCELLED"}
+        except httpx.HTTPStatusError as e:
+            body = e.response.text[:300] if e.response.text else ""
+            logger.error("kite_cancel_order_failed status=%d order_id=%s body=%s",
+                         e.response.status_code, order_id, body)
+            return {"order_id": order_id, "status": "ERROR",
+                    "message": f"HTTP {e.response.status_code}: {body}"}
+        except httpx.RequestError as e:
+            logger.error("kite_cancel_order_failed error=%s", str(e))
+            return {"order_id": order_id, "status": "ERROR", "message": str(e)}
+
+    async def order_history(self, order_id: str) -> list:
+        """
+        Fetch the order history (status updates over time).
+        Kite endpoint: GET /orders/{order_id}
+        Returns: list of dicts, each with status/timestamp/etc., in
+                 CHRONOLOGICAL order -- index 0 is the OLDEST event, the
+                 current state is the LAST entry.
+
+        [ORDER-HISTORY-2026-07-17] This docstring used to claim "Index 0 is
+        the most recent", and three call sites believed it. Zerodha returns
+        the history ascending, so history[0] is the initial PUT-ORDER-REQ /
+        OPEN event and a filled order NEVER shows COMPLETE at index 0. On
+        2026-07-17 the JINDWORLD edge-live entry polled history[0] for 74s,
+        declared timeout, and tried to cancel -- every live edge entry since
+        2026-07-15 died this way (the accept-watchdog's "entry_status=
+        timeout 100%" alarm). Use latest_order_state() to read the current
+        status; do not index the list directly.
+        """
+        if not order_id:
+            return []
+        await self.limiter.acquire()
+        try:
+            resp = await self.client.get(f"/orders/{order_id}")
+            resp.raise_for_status()
+            data = resp.json().get("data", [])
+            return data if isinstance(data, list) else [data]
+        except httpx.HTTPStatusError as e:
+            logger.error("kite_order_history_failed status=%d order_id=%s",
+                         e.response.status_code, order_id)
+            return []
+        except httpx.RequestError as e:
+            logger.error("kite_order_history_failed error=%s", str(e))
+            return []
+
+    async def orders_snapshot(self) -> list | None:
+        """Return today's broker order book, or ``None`` when unreadable.
+
+        An empty successful response is materially different from a transport
+        failure for idempotency recovery: only the former proves that a stable
+        tagged order was not accepted and may be submitted.
+        """
+        await self.limiter.acquire()
+        try:
+            resp = await self.client.get("/orders")
+            resp.raise_for_status()
+            data = resp.json().get("data", [])
+            return data if isinstance(data, list) else []
+        except httpx.HTTPStatusError as e:
+            logger.error("kite_orders_snapshot_failed status=%d", e.response.status_code)
+            return None
+        except httpx.RequestError as e:
+            logger.error("kite_orders_snapshot_failed error=%s", str(e))
+            return None
+
+    async def order_trades(self, order_id: str) -> list | None:
+        """Today's executions for one order; None means broker read failed."""
+        if not order_id:
+            return None
+        await self.limiter.acquire()
+        try:
+            resp = await self.client.get(f"/orders/{order_id}/trades")
+            resp.raise_for_status()
+            payload = resp.json()
+            data = payload.get("data") if isinstance(payload, dict) else None
+            return data if isinstance(data, list) else None
+        except (httpx.HTTPStatusError, httpx.RequestError, ValueError) as exc:
+            logger.error("kite_order_trades_failed order_id=%s error=%s", order_id, str(exc))
+            return None
+
+    async def get_broker_positions(self) -> dict:
+        """Broker-side positions. Kite endpoint: GET /portfolio/positions.
+        Returns {"net": [...], "day": [...]} ({} on failure).
+
+        [ORDER-HISTORY-2026-07-17] Added for post-timeout reconciliation:
+        when an entry order's final state cannot be determined (history
+        fetch failed, cancel returned "order does not exist"), the last
+        word on whether we actually hold stock is the positions book, not
+        our bookkeeping. See PennyExecutor.execute_entry."""
+        await self.limiter.acquire()
+        try:
+            resp = await self.client.get("/portfolio/positions")
+            resp.raise_for_status()
+            data = resp.json().get("data", {})
+            return data if isinstance(data, dict) else {}
+        except httpx.HTTPStatusError as e:
+            logger.error("kite_positions_failed status=%d", e.response.status_code)
+            return {}
+        except httpx.RequestError as e:
+            logger.error("kite_positions_failed error=%s", str(e))
+            return {}
+
+
+def latest_order_state(history: list) -> dict:
+    """Current state row of a GET /orders/{id} history response.
+
+    Kite returns rows in CHRONOLOGICAL order (oldest first). Sorting by
+    order_timestamp instead of blindly taking [-1] keeps this correct even
+    if a relay/proxy ever reorders rows; rows without a timestamp fall back
+    to list position. Returns {} for an empty history."""
+    if not history:
+        return {}
+    try:
+        return max(
+            enumerate(history),
+            key=lambda ih: (str(ih[1].get("order_timestamp") or ""), ih[0]),
+        )[1]
+    except (TypeError, AttributeError):
+        return history[-1]

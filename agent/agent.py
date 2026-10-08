@@ -1,0 +1,1906 @@
+import os
+import re
+import sys
+import time
+import json
+import hashlib
+import logging
+import structlog
+import threading
+import urllib.parse
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
+from typing import List, Dict, Optional
+import requests
+from bs4 import BeautifulSoup
+import schedule
+from openai import OpenAI
+from pydantic import BaseModel, ValidationError
+
+from advisory import (  # [ADVISORY 2026-08-05] typed verdicts
+    Review,
+    Verdict,
+    from_payload as review_from_payload,
+    unavailable as advisory_unavailable,
+)
+from async_reviews import AsyncReviewQueue
+import news_classifier  # [WORKFLOW-I.4.D 2026-09-14]
+
+# -------------------------------------------------------------------------
+# CONFIG & LOGGING
+# -------------------------------------------------------------------------
+# [ROADMAP-4.7 2026-07-13] structlog, matching python-engine's pipeline.
+#
+# The agent was the last container still on a bare logging.basicConfig, so its
+# lines rendered differently from every other service and could not carry
+# structured key/values. The pipeline below is a deliberate mirror of
+# python-engine/logging_setup.py -- same TimeStamper format, same
+# ConsoleRenderer, colours off (the docker json-file driver strips ANSI anyway).
+#
+# It is DUPLICATED rather than imported, and that is not laziness: the agent is
+# a separate docker build context and cannot see ../python-engine. Sharing it
+# would mean restructuring the build for a 20-line config. (Roadmap 4.2 is the
+# cautionary tale in the other direction -- do not invent shared structure that
+# does not fit.)
+#
+# The rendered shape is preserved on purpose: timestamp, level, message, in that
+# order. The 2026-07-13 forensics were done by eye against these logs, and a
+# format churn that broke `docker logs agent | grep` would cost more than it
+# gained. Existing logger.info(f"...") call sites keep working unchanged --
+# structlog takes the message as the event.
+#
+# stdlib logging is wired to the same formatter so `schedule`, `requests` and
+# `urllib3` do not punch through with a different shape.
+_timestamper = structlog.processors.TimeStamper(
+    fmt="%Y-%m-%d %H:%M:%S",
+    utc=False,  # local time = IST in this container (TZ=Asia/Kolkata)
+)
+
+structlog.configure(
+    processors=[
+        structlog.contextvars.merge_contextvars,
+        structlog.processors.add_log_level,
+        _timestamper,
+        structlog.processors.format_exc_info,
+        structlog.dev.ConsoleRenderer(colors=False, event_key="event"),
+    ],
+    wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
+    logger_factory=structlog.PrintLoggerFactory(file=sys.stdout),
+    cache_logger_on_first_use=True,
+)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+
+logger = structlog.get_logger("agent")
+
+# [MINIMAX-MIGRATION 2026-07-15] The reasoning gate moved off Google Gemini
+# onto MiniMax, which exposes an OpenAI-compatible chat-completions endpoint.
+# We drive it with the stock `openai` SDK pointed at MiniMax's base_url, so the
+# rest of the pipeline (threaded hard wall, JSON parse guard, fallback banner)
+# is unchanged -- only the transport and the model name differ.
+#
+# Base URL and model are env-overridable so the operator can retarget the
+# international vs mainland endpoint, or bump the model, without a code change.
+MINIMAX_API_KEY = os.getenv("MINIMAX_API_KEY")
+MINIMAX_BASE_URL = os.getenv("MINIMAX_BASE_URL", "https://api.minimax.io/v1")
+MINIMAX_MODEL = os.getenv("MINIMAX_MODEL", "MiniMax-M3")
+# [MINIMAX-TIMEOUT 2026-08-04] See analyze_with_minimax for why these moved off
+# a flat 30s. Budget: one attempt + one retry must fit inside the wall, and the
+# wall must stay well inside the 3-minute momentum poll.
+MINIMAX_REQUEST_TIMEOUT_SEC = int(os.getenv("MINIMAX_REQUEST_TIMEOUT_SEC", "45"))
+MINIMAX_MAX_RETRIES = int(os.getenv("MINIMAX_MAX_RETRIES", "1"))
+MINIMAX_WALL_TIMEOUT_SEC = int(os.getenv("MINIMAX_WALL_TIMEOUT_SEC", "100"))
+# Optional asynchronous annotations are deliberately opt-in.  They are useful
+# for non-blocking second opinions, but must never silently replace an
+# operator's configured synchronous hard-veto policy.
+MINIMAX_ASYNC_REVIEW_ENABLED = os.getenv("MINIMAX_ASYNC_REVIEW_ENABLED", "false").strip().lower() in {
+    "1", "true", "yes", "on",
+}
+MINIMAX_ASYNC_REVIEW_MAX_PENDING = int(os.getenv("MINIMAX_ASYNC_REVIEW_MAX_PENDING", "16"))
+MINIMAX_ASYNC_REVIEW_DAILY_BUDGET = int(os.getenv("MINIMAX_ASYNC_REVIEW_DAILY_BUDGET", "40"))
+MINIMAX_ASYNC_REVIEW_DEADLINE_SEC = int(os.getenv("MINIMAX_ASYNC_REVIEW_DEADLINE_SEC", "90"))
+# [WORKFLOW-I I1 2026-09-13] The prompt-version identifier. Bumped when
+# the analyst prompt template changes; cached reviews keep the version
+# they were reviewed with so a prompt change never invalidates an old
+# annotation silently. Per plan §13: "Store model/prompt/version ...
+# expiry." The default ``v1`` covers the existing analyst prompt; future
+# bumps should be deliberate, with a note in the prompt diff.
+MINIMAX_PROMPT_VERSION = os.getenv("MINIMAX_PROMPT_VERSION", "v1")
+
+
+# [WORKFLOW-I I.A 2026-09-13] Opt-in flag for including I3 usefulness
+# metrics in the optional-AI status envelope posted to the engine.
+# Default ``false`` because the existing operator dashboards and the
+# engine's allow-list only know the bounded queue counters; rolling
+# out usefulness cross-container is a separate observable change.
+# Operators enable it after the engine-side validator accepts the
+# new field. See ``python-engine/optional_ai_status.py::_ALLOWED_USEFULNESS_KEYS``.
+OPTIONAL_AI_REPORT_USEFULNESS = (
+    os.getenv("OPTIONAL_AI_REPORT_USEFULNESS", "false").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+
+
+def _effective_classification_expiry(
+    pre_classifications: Optional[List["ClassificationResult"]],
+    requested_expiry: Optional[datetime],
+    *,
+    now: Optional[datetime] = None,
+) -> Optional[datetime]:
+    """Bound annotation validity by request and every source clock."""
+    if not pre_classifications:
+        return requested_expiry
+    current = now or datetime.now(timezone.utc)
+    bounds = [requested_expiry] if requested_expiry is not None else []
+    for classification in pre_classifications:
+        bound = classification.source_valid_until
+        if bound is None:
+            bound = classification.classified_at or current
+        if bound.tzinfo is None or bound.utcoffset() is None:
+            bound = current
+        bounds.append(bound.astimezone(timezone.utc))
+    return min(bounds) if bounds else requested_expiry
+
+
+def _attach_classification_context(
+    review: Review,
+    pre_classifications: Optional[List["ClassificationResult"]],
+    expires_at: Optional[datetime],
+) -> Review:
+    """Attach bounded source evidence without claiming a model call ran."""
+    effective_expiry = _effective_classification_expiry(
+        pre_classifications, expires_at,
+    )
+    if pre_classifications is None:
+        return replace(review, expires_at=effective_expiry)
+    source_references = tuple(dict.fromkeys(
+        (
+            c.source_ref,
+            c.source_url,
+            c.published_at.isoformat() if c.published_at else "",
+        )
+        for c in pre_classifications
+        if c.source_ref or c.source_url or c.published_at
+    ))
+    return replace(
+        review,
+        classification_context_sha256=(
+            news_classifier.classification_context_sha256(pre_classifications)
+        ),
+        classification_count=len(pre_classifications),
+        source_references=source_references,
+        expires_at=effective_expiry,
+    )
+
+
+# [WORKFLOW-I I1 2026-09-13] Helper that attaches provenance fields to a
+# Review. Used at every return site of ``analyze_with_minimax`` so each
+# review carries model/base_url/prompt_version/started_at/completed_at/
+# response_seconds. ``Review`` is frozen so we use ``dataclasses.replace``.
+def _attach_provenance(
+    review: Review,
+    *,
+    started_at: datetime,
+    completed_at: datetime,
+    pre_classifications: Optional[List["ClassificationResult"]] = None,
+    expires_at: Optional[datetime] = None,
+) -> Review:
+    """Return a copy of ``review`` with provenance fields populated.
+
+    Per plan §13: "Store model/prompt/version ... response time and
+    expiry." A future model or prompt change must NOT retroactively
+    re-label old annotations; the captured fields freeze the inputs
+    that produced the verdict.
+    """
+    response_seconds = max(
+        0.0,
+        (completed_at - started_at).total_seconds(),
+    )
+    review = _attach_classification_context(
+        review, pre_classifications, expires_at,
+    )
+    return replace(
+        review,
+        model=MINIMAX_MODEL,
+        base_url=MINIMAX_BASE_URL,
+        prompt_version=MINIMAX_PROMPT_VERSION,
+        started_at=started_at,
+        completed_at=completed_at,
+        response_seconds=response_seconds,
+    )
+# [ADVISORY 2026-08-05] What to do when the reviewer cannot render an opinion.
+# "proceed" (default) preserves today's behaviour exactly: the alert goes out
+# with an UNAVAILABLE banner and the operator decides. "block" refuses to send
+# an EXEC button for a signal nobody reviewed. That is a real risk-posture
+# choice -- proceed means trading unreviewed, block means a MiniMax outage
+# stops the momentum book -- so it is configuration, not a silent default.
+MINIMAX_UNAVAILABLE_POLICY = os.getenv("MINIMAX_UNAVAILABLE_POLICY", "proceed")
+# The deterministic engine already owns entry geometry, stop placement and
+# position sizing.  MiniMax is a useful second opinion, but making its
+# nondeterministic score a mandatory gate hid otherwise valid, bounded-risk
+# signals from the operator (for example GRAVITA on 2026-08-28).  The default
+# is therefore advisory: show the warning and preserve the human decision.
+# Operators who deliberately want the old hard veto can set this to "block".
+MOMENTUM_MINIMAX_REJECT_POLICY = os.getenv(
+    "MOMENTUM_MINIMAX_REJECT_POLICY", "advisory"
+).strip().lower()
+if MOMENTUM_MINIMAX_REJECT_POLICY not in {"advisory", "block"}:
+    logger.warning(
+        "Invalid MOMENTUM_MINIMAX_REJECT_POLICY="
+        f"{MOMENTUM_MINIMAX_REJECT_POLICY!r}; "
+        "falling back to the safer 'block' policy."
+    )
+    MOMENTUM_MINIMAX_REJECT_POLICY = "block"
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+QUANT_ENGINE_URL = os.getenv("QUANT_ENGINE_URL", "http://python-engine:8000/signals")
+
+# [HIGH-007 / ROADMAP-4.5 2026-07-13] Snapshot registration.
+#
+# This container is the ONLY thing that decides what numbers the operator
+# sees on an EXEC/EM button. Until now it sent the button and threw the
+# payload away -- so node-gateway, on the press, had to go and re-ask the
+# engine what the signal was, and executed whatever came back. That is not
+# the same object: /signals serves `current_signals`, which run_screener
+# replaces wholesale on every run, and the momentum list is in-memory and
+# dies with the engine process (as it did on 2026-07-13 at 09:44).
+#
+# So register the exact payload here, under the SAME id that goes into
+# callback_data, before the button is shown. What the operator approves is
+# then what executes.
+NODE_GATEWAY_URL = os.getenv("NODE_GATEWAY_URL", "http://node-gateway:3000")
+INTERNAL_API_SECRET = os.getenv("INTERNAL_API_SECRET", "")
+OPTIONAL_AI_STATUS_URL = os.getenv(
+    "OPTIONAL_AI_STATUS_URL",
+    QUANT_ENGINE_URL.rsplit("/signals", 1)[0] + "/ops/optional-ai-status",
+)
+
+
+def register_approved_snapshot(sig_id: str, ticker: str, action: str, payload: dict) -> bool:
+    """Persist the payload we are about to display, keyed by its callback id.
+
+    Best-effort BY DESIGN, and the asymmetry is deliberate: if registration
+    fails we still send the alert, because node falls back to the old live
+    re-fetch and a slightly-stale trade beats no trade at all. But it logs
+    loudly, and node logs `approved_snapshot_missing` on the press, so the
+    fallback can never be mistaken for the happy path.
+    """
+    try:
+        resp = requests.post(
+            f"{NODE_GATEWAY_URL}/api/internal/register-signal",
+            json={
+                "signal_id": sig_id,
+                "ticker": ticker,
+                "action": action,
+                "payload": payload,
+            },
+            headers={"X-Internal-Secret": INTERNAL_API_SECRET},
+            timeout=5,
+        )
+        resp.raise_for_status()
+        body = resp.json()
+        if not body.get("registered"):
+            # Already present -- the snapshot is immutable and first-wins, so
+            # this is correct behaviour on a re-alert, not an error.
+            logger.info(f"Snapshot already registered for {sig_id} (first-wins)")
+        else:
+            logger.info(f"Registered approved snapshot for {sig_id}")
+        return True
+    except Exception as e:
+        logger.error(
+            f"Snapshot registration FAILED for {sig_id}: {e} -- "
+            f"alert will still be sent; node will fall back to a live re-fetch "
+            f"and the executed numbers may differ from those displayed."
+        )
+        return False
+
+if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID]):
+    logger.critical("CRITICAL: Missing Telegram environment variables. Exiting.")
+    sys.exit(1)
+
+# [MINIMAX-TIMEOUT 2026-08-04] max_retries=1 (SDK default is 2). The retries
+# happen INSIDE the per-request budget, so the default made the budget
+# unsatisfiable, and an abandoned daemon thread kept spending API calls after
+# the wall had already given up on it.
+client = None
+AI_STATUS = "AI_DISABLED"
+_optional_ai_queue: Optional[AsyncReviewQueue] = None
+if MINIMAX_API_KEY:
+    client = OpenAI(
+        api_key=MINIMAX_API_KEY,
+        base_url=MINIMAX_BASE_URL,
+        max_retries=MINIMAX_MAX_RETRIES,
+    )
+    AI_STATUS = "AI_AVAILABLE"
+else:
+    logger.warning("AI_DISABLED: no MINIMAX_API_KEY; deterministic alerts remain active")
+
+# -------------------------------------------------------------------------
+# SHORT-TERM MEMORY (DEDUPLICATION)
+# -------------------------------------------------------------------------
+# [ROADMAP-4.7 2026-07-13] Dedup state is now DURABLE.
+#
+# It used to be a bare in-memory set, so any agent bounce forgot everything it
+# had already alerted and re-sent EXEC buttons for signals the operator had
+# already seen -- and, worse, may have already acted on. Duplicate buttons for
+# a live trade are not a cosmetic annoyance.
+#
+# Persisted to /tmp, not /data: the agent mounts /data READ-ONLY (it only reads
+# scheduler_tick.json for the freeze watchdog), and its heartbeat already lives
+# in /tmp for the same reason. /tmp survives a process crash and a `docker
+# restart` -- which is the bounce that actually happens -- and is lost only on
+# a full container recreate, where re-alerting is the lesser evil anyway.
+#
+# Day-stamped: a file from a previous day must never suppress today's alerts.
+DEDUP_FILE = "/tmp/agent_dedup.json"
+
+processed_signals_today = set()
+
+
+def _today_str() -> str:
+    # Container runs TZ=Asia/Kolkata, so this is already the IST trading day.
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def _load_dedup_state() -> None:
+    """Restore today's alerted ids on boot. Never raises: a corrupt or absent
+    file must degrade to 'remember nothing' (re-alert), never to a crash.
+
+    [WORKFLOW-C.B.2 2026-09-15] F-7 from the 2026-09-15 production
+    audit: when the agent processes zero signals in a day, the
+    dedup file is never created -- operators cannot distinguish
+    "agent booted today but found no signals" from "agent did
+    not boot at all". The bounded fix: if the file does not
+    exist on boot, write an initial empty-state file with
+    ``{"date": <today>, "ids": []}``. The file's existence is
+    now a clean "agent booted today" marker; its content
+    reflects processed-signal state.
+
+    This is a pure observability improvement. The dedup
+    mechanism itself is unchanged: a missing file still means
+    "remember nothing" (re-alert), and the new initial write
+    is the same payload that ``_save_dedup_state`` would have
+    produced. No new dependencies.
+    """
+    try:
+        with open(DEDUP_FILE) as fh:
+            state = json.load(fh)
+        if state.get("date") != _today_str():
+            logger.info("Dedup file is from a previous day -- starting fresh.")
+            # [WORKFLOW-C.B.2] Don't leave yesterday's stale
+            # file lying around -- write today's empty state
+            # so the file's existence is always a "fresh boot"
+            # marker. ``_save_dedup_state`` is the same code
+            # path used for the periodic save, so the format
+            # is identical to what subsequent writes would
+            # produce.
+            _save_dedup_state()
+            return
+        processed_signals_today.update(state.get("ids", []))
+        logger.info(
+            f"Restored {len(processed_signals_today)} already-alerted signal(s) "
+            f"from {DEDUP_FILE} -- a restart will not re-alert them."
+        )
+    except FileNotFoundError:
+        # [WORKFLOW-C.B.2] The file is missing. Either the
+        # container was just restarted (no prior state) OR
+        # the operator has been investigating the audit's
+        # F-7 finding by deleting the file. Either way,
+        # write today's initial state so the file's
+        # existence is a "fresh boot" marker.
+        _save_dedup_state()
+    except Exception as e:
+        logger.error(f"Could not read dedup state ({e}) -- starting fresh.")
+
+
+def _save_dedup_state() -> None:
+    """Atomic write: a torn file read on the next boot would silently drop the
+    dedup memory, which is the exact failure this whole mechanism exists to
+    prevent."""
+    try:
+        tmp = f"{DEDUP_FILE}.tmp"
+        with open(tmp, "w") as fh:
+            json.dump(
+                {"date": _today_str(), "ids": sorted(processed_signals_today)}, fh
+            )
+        os.replace(tmp, DEDUP_FILE)
+    except Exception as e:
+        logger.error(f"Could not persist dedup state: {e}")
+
+
+def mark_processed(sig_id: str) -> None:
+    """Record an alerted signal, durably."""
+    processed_signals_today.add(sig_id)
+    _save_dedup_state()
+
+
+def clear_memory():
+    processed_signals_today.clear()
+    _save_dedup_state()
+    logger.info("Cleared daily signal memory for the new trading day.")
+
+# -------------------------------------------------------------------------
+# LIVENESS: OWN HEARTBEAT (roadmap 2.2) + ENGINE FREEZE WATCHDOG (2.4)
+# -------------------------------------------------------------------------
+# [ROADMAP-2.2 2026-07-12] This container had no healthcheck at all: if
+# it died or hung, momentum EXEC alerts stopped with zero alarm. The
+# Dockerfile HEALTHCHECK compares this file's mtime against a 15-min
+# threshold; autoheal (docker-compose) restarts the container when it
+# turns unhealthy. Touched from the main loop (every 30s) AND at the top
+# of each per-signal iteration, so a long MiniMax batch can't trip a
+# false unhealthy while real work is progressing.
+HEARTBEAT_FILE = "/tmp/agent_heartbeat"
+
+def touch_heartbeat():
+    """Must never raise -- liveness reporting can't break the pipeline."""
+    try:
+        with open(HEARTBEAT_FILE, "w") as fh:
+            fh.write(str(time.time()))
+    except Exception as e:
+        logger.error(f"Heartbeat touch failed: {e}")
+
+# [ROADMAP-2.4 2026-07-12] External loop-progress watchdog for the
+# engine. python-engine's APScheduler writes /data/scheduler_tick.json
+# every 60s FROM THE SCHEDULER LOOP ITSELF (its daemon-thread liveness
+# heartbeat deliberately keeps ticking through a frozen loop, so it
+# cannot detect this). We are a separate process in a separate
+# container: if that file goes stale during market hours, jobs have
+# stopped firing -- the 2026-07-07 pattern that ran 6h32m unnoticed.
+# Alert goes straight to the Telegram API (not via node's /notify) so
+# it works no matter what state the other containers are in.
+SCHEDULER_TICK_FILE = "/data/scheduler_tick.json"
+ENGINE_FREEZE_THRESHOLD_SEC = 600         # 10 min = ten missed 60s ticks
+
+# [POLL-CADENCE 2026-08-04] How often to poll the engine for momentum signals
+# during market hours. See the scheduling block in main() for why this replaced
+# a fixed :10/:25/:40/:55 grid.
+MOMENTUM_POLL_INTERVAL_MIN = int(os.getenv("MOMENTUM_POLL_INTERVAL_MIN", "3"))
+ENGINE_FREEZE_ALERT_COOLDOWN_SEC = 1800   # re-page at most every 30 min
+_engine_freeze_last_alert_ts: Optional[float] = None
+
+def _is_market_hours(now=None) -> bool:
+    """Mon-Fri 09:15-15:30. Container TZ is Asia/Kolkata, so naive
+    datetime.now() is IST. No holiday check needed: the engine's tick
+    job runs 24/7, so on a holiday the file is fresh anyway."""
+    from datetime import datetime
+    now = now or datetime.now()
+    if now.weekday() >= 5:
+        return False
+    minutes = now.hour * 60 + now.minute
+    return 9 * 60 + 15 <= minutes <= 15 * 60 + 30
+
+def read_scheduler_tick_age(path=None) -> Optional[float]:
+    """Seconds since the engine's last scheduler tick, or None when the
+    file is missing/unreadable (engine down, pre-2.4 build, or /data
+    not mounted)."""
+    path = path or SCHEDULER_TICK_FILE
+    try:
+        with open(path) as fh:
+            payload = json.load(fh)
+        return max(0.0, time.time() - float(payload["ts_epoch"]))
+    except Exception:
+        return None
+
+def check_engine_liveness():
+    """Scheduled every 5 min; alerts (cooldown 30 min) when the engine's
+    scheduler tick is stale or missing during market hours."""
+    global _engine_freeze_last_alert_ts
+    if not _is_market_hours():
+        return
+    age = read_scheduler_tick_age()
+    if age is not None and age < ENGINE_FREEZE_THRESHOLD_SEC:
+        return
+
+    now = time.time()
+    if (_engine_freeze_last_alert_ts is not None
+            and now - _engine_freeze_last_alert_ts < ENGINE_FREEZE_ALERT_COOLDOWN_SEC):
+        return
+    _engine_freeze_last_alert_ts = now
+
+    if age is None:
+        msg = ("🧊 ENGINE WATCHDOG: cannot read the scheduler tick file "
+               f"({SCHEDULER_TICK_FILE}). python-engine may be DOWN, or /data "
+               "is not mounted. Check: docker ps && docker logs python-engine")
+    else:
+        msg = ("🧊 ENGINE LOOP FROZEN? python-engine's scheduler tick is "
+               f"{int(age // 60)} min old (threshold {ENGINE_FREEZE_THRESHOLD_SEC // 60} min). "
+               "Jobs have stopped firing -- the 2026-07-07 freeze pattern. "
+               "Check: docker logs python-engine --since 15m | grep penny_liveness_tick "
+               "(ticks present = loop frozen, restart the container; "
+               "ticks absent = process dead).")
+    logger.error(f"Engine liveness watchdog firing: age={age}")
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    try:
+        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10)
+    except Exception as e:
+        logger.error(f"Failed to send engine watchdog alert: {e}")
+
+# -------------------------------------------------------------------------
+# SCHEMAS
+# -------------------------------------------------------------------------
+class SignalOutput(BaseModel):
+    conviction_score: int
+    pitch: str
+    rationale: str
+    risks: str
+
+
+# [WORKFLOW-I I2 2026-09-13] NewsItem captures the §13 "reliable source"
+# requirement: every news item carries a parseable publication timestamp
+# and a source URL. The dataclass is frozen so a NewsItem cannot be
+# silently mutated after extraction (which would invalidate the §13
+# audit trail). ``published_at_parsed`` is None when the source did
+# not provide a parseable timestamp; ``age_label`` is computed from
+# ``published_at_parsed`` at extraction time (so the model sees a
+# stable label even if the news is cached).
+@dataclass(frozen=True)
+class NewsItem:
+    title: str
+    source_url: str
+    published_at_raw: str  # the raw pubDate string from the RSS item
+    published_at_parsed: Optional[datetime]  # tz-aware UTC, or None
+    source_name: str  # the RSS <source> element or hostname fallback
+    age_label: str  # "fresh", "2 hours ago", "3 days ago", "stale_or_unknown"
+
+    @property
+    def has_publication_timestamp(self) -> bool:
+        return self.published_at_parsed is not None
+
+# -------------------------------------------------------------------------
+# CORE FUNCTIONS
+# -------------------------------------------------------------------------
+def fetch_signals() -> List[Dict]:
+    """Fetch raw quant signals from Container B."""
+    try:
+        # [ROADMAP-4.7 2026-07-13] Send the internal secret. /signals is not
+        # gated on the engine side today, so this changes nothing yet -- which
+        # is exactly why it should go in NOW rather than being discovered as a
+        # 403 on the morning someone gates it. The sibling momentum poll below
+        # already sends it; this was the odd one out.
+        response = requests.get(
+            QUANT_ENGINE_URL,
+            headers={"X-Internal-Secret": INTERNAL_API_SECRET},
+            timeout=10,
+        )
+        response.raise_for_status()
+        data = response.json()
+        
+        # CRITICAL FIX: Unwrap the PortfolioResponse envelope
+        signals = data.get("signals", [])
+        
+        if not isinstance(signals, list):
+            logger.error("Invalid response format from Quant Engine.")
+            return []
+        return signals
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Failed to fetch signals from {QUANT_ENGINE_URL}: {e}")
+        return []
+
+def fetch_rss_feed(url: str, limit: int = 3) -> str:
+    """[WORKFLOW-I I2 2026-09-13] Returns a flat string of titles.
+
+    Backwards-compatible: existing callers (and tests) receive a
+    string. The structured ``NewsItem`` form is exposed via
+    :func:`fetch_news_items`. The string here is the legacy format
+    ``- title1 | - title2 | ...`` with no timestamps; the model's
+    prompt relies on :func:`scrape_sentiment`'s structured form
+    instead.
+    """
+    items = fetch_news_items(url, limit=limit)
+    if not items:
+        return ""
+    texts = [f"- {item.title}" for item in items]
+    return " | ".join(texts)
+
+
+def fetch_news_items(url: str, limit: int = 3) -> List[NewsItem]:
+    """[WORKFLOW-I I2 2026-09-13] Return a structured ``NewsItem`` list.
+
+    Per plan §13: *"News must have publication/event timestamps and a
+    reliable source; an unsupported model statement is not a market
+    fact."* This function is the structured counterpart of
+    :func:`fetch_rss_feed`: every item carries a parseable
+    ``published_at_parsed`` (or None) and a ``source_url`` /
+    ``source_name``.
+
+    The RSS schema is RSS 2.0 (Yahoo Finance, Google News). ``<item>``
+    elements may contain:
+
+      * ``<title>`` — item headline (required for our purposes)
+      * ``<link>`` — source URL (we fall back to ``""`` if absent)
+      * ``<pubDate>`` — RFC 822 / RFC 1123 date string (we parse
+        using :mod:`email.utils.parsedate_to_datetime` for both
+        Yahoo and Google News formats)
+      * ``<source>`` — RSS source element, often the publisher's
+        domain. We fall back to the request URL's hostname.
+
+    Items without a parseable ``<pubDate>`` are kept (the §13 rule
+    is "must have", but a missing timestamp may indicate a feed
+    issue we want to surface, not silently drop). The
+    ``age_label`` for such items is ``"stale_or_unknown"``.
+    """
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+    try:
+        res = requests.get(url, headers=headers, timeout=5)
+        res.raise_for_status()
+    except Exception as e:
+        logger.warning(f"RSS fetch failed for {url}: {e}")
+        return []
+    soup = BeautifulSoup(res.content, 'xml')
+    items_xml = soup.find_all('item', limit=limit)
+    parsed: List[NewsItem] = []
+    for item in items_xml:
+        title = item.title.text if item.title else ""
+        link = item.link.text if item.link else ""
+        link = (link or "").strip()
+        # RSS <pubDate> uses RFC 822 / RFC 1123 format, e.g.
+        # "Tue, 13 Sep 2026 14:25:00 +0530" or
+        # "Tue, 13 Sep 2026 08:55:00 GMT".
+        pub_raw = item.pubDate.text if item.pubDate else ""
+        pub_parsed = _parse_rss_pubdate(pub_raw)
+        # <source url="...">name</source> -- we capture the name.
+        src_tag = item.find('source')
+        if src_tag is not None and src_tag.text:
+            src_name = src_tag.text.strip()
+        else:
+            src_name = _hostname_from_url(url)
+        age_label = _age_label(pub_parsed)
+        parsed.append(NewsItem(
+            title=title,
+            source_url=link,
+            published_at_raw=pub_raw,
+            published_at_parsed=pub_parsed,
+            source_name=src_name or _hostname_from_url(url),
+            age_label=age_label,
+        ))
+    return parsed
+
+
+def _parse_rss_pubdate(raw: str) -> Optional[datetime]:
+    """Parse an RSS ``<pubDate>`` into a tz-aware UTC datetime.
+
+    Both Yahoo Finance and Google News use RFC 822 / RFC 1123
+    formats; :func:`email.utils.parsedate_to_datetime` handles
+    both. Returns None on any parse error so the caller can
+    surface ``stale_or_unknown`` rather than crashing.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    try:
+        from email.utils import parsedate_to_datetime
+        dt = parsedate_to_datetime(raw)
+    except (TypeError, ValueError):
+        return None
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _hostname_from_url(url: str) -> str:
+    """Best-effort hostname extraction for the source fallback."""
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(url).hostname or ""
+        return host
+    except Exception:
+        return ""
+
+
+def _age_label(published_at: Optional[datetime], *,
+               now: Optional[datetime] = None) -> str:
+    """Render an age label for the model prompt.
+
+    The label is what the model sees; the raw timestamp stays on
+    the dataclass for audit. Labels:
+
+      * None or unparseable -> ``"stale_or_unknown"``
+      * ``<= 1 hour``       -> ``"fresh"``
+      * hours / days        -> ``"N hours ago"`` / ``"N days ago"``
+      * ``> 7 days``         -> ``"stale_aged_Nd"`` (still surfaced,
+        but explicitly labelled so the model knows)
+
+    The function takes ``now`` for testability; production callers
+    omit it.
+    """
+    if published_at is None:
+        return "stale_or_unknown"
+    cur = now if now is not None else datetime.now(timezone.utc)
+    delta = cur - published_at
+    seconds = delta.total_seconds()
+    if seconds < 0:
+        # Clock skew or future-dated feed item -- surface honestly.
+        return "future_dated"
+    if seconds <= 3600:
+        return "fresh"
+    hours = int(seconds // 3600)
+    if hours < 24:
+        return f"{hours} hours ago"
+    days = int(seconds // 86400)
+    if days <= 7:
+        return f"{days} days ago"
+    return f"stale_aged_{days}d"
+
+
+def _fetch_news_bundle_for_ticker(
+    ticker: str,
+) -> tuple[List[NewsItem], List[NewsItem]]:
+    """Fetch each configured feed exactly once for one signal evaluation."""
+    logger.info(f"Gathering multi-source intelligence for {ticker}...")
+    yahoo_url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={ticker}&region=US&lang=en-US"
+    try:
+        yahoo_items = fetch_news_items(yahoo_url, limit=4)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "news_yahoo_fetch_failed ticker=%s err=%s",
+            ticker, type(exc).__name__,
+        )
+        yahoo_items = []
+
+    encoded_ticker = urllib.parse.quote(f"{ticker} stock")
+    google_url = f"https://news.google.com/rss/search?q={encoded_ticker}&hl=en-US&gl=US&ceid=US:en"
+    try:
+        google_items = fetch_news_items(google_url, limit=4)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "news_google_fetch_failed ticker=%s err=%s",
+            ticker, type(exc).__name__,
+        )
+        google_items = []
+    return yahoo_items, google_items
+
+
+def _render_news_bundle(
+    yahoo_items: List[NewsItem], google_items: List[NewsItem],
+) -> str:
+    """Render the same immutable items later supplied to classification."""
+    if not yahoo_items and not google_items:
+        return ""
+
+    def _render(items: List[NewsItem], header: str) -> str:
+        lines = [header]
+        for item in items:
+            ts = f"[{item.age_label}]"
+            src = f"({item.source_name})" if item.source_name else ""
+            url = item.source_url or "<no-url>"
+            lines.append(f"  {ts} {src} {item.title}")
+            lines.append(f"    url: {url}")
+        return "\n".join(lines)
+
+    return (
+        _render(yahoo_items, "YAHOO FINANCE FEED:")
+        + "\n\n"
+        + _render(google_items, "BROADER MARKET FEED:")
+    )
+
+
+def scrape_sentiment(ticker: str) -> str:
+    """[WORKFLOW-I I2 2026-09-13] Render a structured sentiment
+    prompt with publication timestamps.
+
+    The prompt now includes, for every item, an explicit age label
+    (e.g. ``"[3 hours ago]"``) and the source URL. This is the §13
+    "reliable source + publication/event timestamp" requirement
+    enforced at the producer boundary: the model cannot mistake a
+    two-week-old headline for fresh news because the prompt says
+    ``"[14 days ago]"``.
+
+    Items without a parseable timestamp are surfaced with
+    ``"[stale_or_unknown]"`` so the model is explicitly told the
+    feed did not provide one.
+    """
+    return _render_news_bundle(*_fetch_news_bundle_for_ticker(ticker))
+
+def _extract_json_object(text: Optional[str]) -> Optional[Dict]:
+    """Pull a single JSON object out of an LLM reply, tolerantly.
+
+    MiniMax is prompted to emit bare JSON, but LLMs still occasionally wrap it
+    in a ```json fence or add a stray sentence. We try a straight parse first,
+    then fall back to the substring between the first '{' and the last '}'.
+    Returns the parsed dict, or None if nothing valid can be recovered (the
+    caller turns that into a SYSTEM FALLBACK alert, never a crash).
+    """
+    if not text:
+        return None
+    # [MINIMAX-REASONING 2026-07-16] MiniMax-M3 is a reasoning model: it emits
+    # its chain-of-thought inline in `content` as a <think>...</think> block
+    # BEFORE the JSON. On 2026-07-16 FIVESTAR came back starting with
+    # "<think>\nLet me analyze this trade..." and the parser (which only knew
+    # about ```json fences) failed -> fail-open SYSTEM FALLBACK, conviction
+    # veto bypassed. Strip closed think blocks first; if an UNCLOSED <think>
+    # remains (the reasoning ran past max_tokens and no JSON was ever emitted),
+    # drop from it to the end -- there is no JSON to recover, so extraction
+    # correctly returns None and the caller takes the fallback path.
+    text = re.sub(r"<think\b[^>]*>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    open_think = re.search(r"<think\b[^>]*>", text, flags=re.IGNORECASE)
+    if open_think:
+        text = text[: open_think.start()]
+    candidate = text.strip()
+    if not candidate:
+        return None
+    # Strip a leading/trailing markdown code fence if present.
+    if candidate.startswith("```"):
+        candidate = candidate.split("```", 2)[1] if candidate.count("```") >= 2 else candidate
+        if candidate.lstrip().lower().startswith("json"):
+            candidate = candidate.lstrip()[4:]
+        candidate = candidate.strip()
+    for attempt in (candidate, text):
+        try:
+            parsed = json.loads(attempt)
+            if isinstance(parsed, dict):
+                return parsed
+        except (json.JSONDecodeError, TypeError):
+            pass
+    # Last resort: grab the outermost brace pair.
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        try:
+            parsed = json.loads(text[start:end + 1])
+            if isinstance(parsed, dict):
+                return parsed
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return None
+
+
+
+def _fetch_news_items_for_ticker(ticker: str) -> List[NewsItem]:
+    """[WORKFLOW-I.4.D 2026-09-14] Fetch the raw NewsItem list
+    that ``scrape_sentiment`` would render. Same URLs, same
+    limit; used by the classifier feature flag.
+
+    Returns an empty list if both feeds fail. Never raises:
+    the classifier is fail-closed and a missing feed is just
+    an empty batch.
+    """
+    yahoo_items, google_items = _fetch_news_bundle_for_ticker(ticker)
+    return [*yahoo_items, *google_items]
+
+
+def _maybe_classify_news(
+    ticker: str,
+    items: Optional[List[NewsItem]] = None,
+) -> Optional[List["ClassificationResult"]]:
+    """[WORKFLOW-I.4.D 2026-09-14] Run the classifier on the
+    ticker's news if the ``ENABLE_NEWS_CLASSIFIER`` env flag is
+    on (and the classifier itself is not disabled).
+
+    Returns None when the flag is off -- this is the existing
+    caller's path (the verdict prompt renders the placeholder
+    text and consumes raw ``sentiment_text`` exactly as before).
+
+    Returns a list of ClassificationResult (possibly empty) when
+    the flag is on. The list is empty when:
+      * the classifier is disabled via ``DISABLE_CLASSIFIER=1``
+      * the feeds returned no items
+      * the classifier raised an exception (fail-closed)
+
+    Returns a non-empty list of bounded ClassificationResult when
+    classification succeeded for at least one headline.
+
+    Never raises; the verdict pipeline consumes raw
+    ``sentiment_text`` even when classification is broken.
+    """
+    if os.getenv("ENABLE_NEWS_CLASSIFIER", "0") != "1":
+        return None
+    if news_classifier.CLASSIFIER_DISABLED:
+        return []
+    try:
+        if items is None:
+            items = _fetch_news_items_for_ticker(ticker)
+        if not items:
+            return []
+        return news_classifier.classify_news_items(items, ticker=ticker)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "news_classifier_unexpected_failure ticker=%s err=%s",
+            ticker, type(exc).__name__,
+        )
+        return []
+
+
+def _collect_news_context(
+    ticker: str,
+) -> tuple[str, Optional[List["ClassificationResult"]]]:
+    """Fetch once, then render and classify the exact same item objects."""
+    yahoo_items, google_items = _fetch_news_bundle_for_ticker(ticker)
+    items = [*yahoo_items, *google_items]
+    return (
+        _render_news_bundle(yahoo_items, google_items),
+        _maybe_classify_news(ticker, items),
+    )
+
+
+def _render_classified_section(
+    classifications: Optional[List["ClassificationResult"]],
+) -> str:
+    """[WORKFLOW-I.4.D 2026-09-14] Render the CLASSIFIED SENTIMENT
+    DATA section for ``analyze_with_minimax``'s prompt.
+
+    Returns the empty string when ``classifications`` is None or
+    empty, so the caller can detect "no section" and fall back to
+    the placeholder. The rendered section lists each headline's
+    title_hash, category, confidence, and rationale -- bounded so
+    a single item cannot bloat the prompt budget.
+
+    Format:
+        HEADLINE <title_hash>  CATEGORY=<cat> CONF=<float>
+          RATIONALE: <one short sentence>
+
+    The section is bounded to MAX_RENDERED_LINES (default 32) so
+    a 100-item news batch does not exceed the prompt budget. If
+    there are more, the section appends a "and N more" line.
+    """
+    if not classifications:
+        return ""
+    MAX_RENDERED_LINES = 32
+    lines: List[str] = []
+    for c in classifications:
+        # ``rationale`` is already bounded to 280 chars by the
+        # classifier; we do a defensive cap here at 120 to keep
+        # the prompt section tight.
+        rationale = c.rationale[:120] if c.rationale else ""
+        lines.append(
+            f"HEADLINE {c.title_hash}  "
+            f"CATEGORY={c.category.value} "
+            f"CONF={c.confidence:.2f}"
+        )
+        if rationale:
+            lines.append(f"  RATIONALE: {rationale}")
+    if len(lines) > MAX_RENDERED_LINES:
+        kept = lines[:MAX_RENDERED_LINES]
+        dropped = (len(lines) - MAX_RENDERED_LINES) // 2
+        kept.append(f"  (and {dropped} more headlines classified)")
+        lines = kept
+    return "\n".join(lines)
+
+
+def analyze_with_minimax(
+    signal: Dict,
+    sentiment_text: str,
+    market_regime: str = "UNKNOWN",
+    pre_classifications: Optional[List["ClassificationResult"]] = None,
+    expires_at: Optional[datetime] = None,
+) -> Review:
+    """[ADVISORY 2026-08-05] Returns a typed Review, never a bare None.
+
+    Every failure path below used to `return None`, which made "the model
+    vetoed this" and "the model never answered" indistinguishable to the
+    caller. They are now distinct verdicts carrying the specific reason, so
+    the operator's phone can say WHICH failure happened and a later audit can
+    tell an outage from an opinion. See advisory.py.
+
+    [WORKFLOW-I.4.D 2026-09-14] Optional ``pre_classifications``: when the
+    caller supplies a list of ``ClassificationResult`` (one per news item),
+    they are surfaced in the prompt as a "CLASSIFIED SENTIMENT DATA" section
+    *above* the existing "MULTI-SOURCE SENTIMENT DATA" section. The model
+    sees both: the bounded taxonomy per headline (regulatory / earnings /
+    M&A / guidance / macro / rumor / technical / unknown) and the raw text.
+    When ``pre_classifications`` is None (the default, and every existing
+    caller's path), the prompt is byte-identical to its pre-I.4.D shape:
+    only "MULTI-SOURCE SENTIMENT DATA" is rendered. This preserves the
+    existing verdict pipeline contract.
+    """
+    started_at = datetime.now(timezone.utc)
+    expires_at = _effective_classification_expiry(
+        pre_classifications, expires_at, now=started_at,
+    )
+    if expires_at is not None and started_at >= expires_at:
+        return _attach_classification_context(
+            advisory_unavailable("review_deadline_elapsed"),
+            pre_classifications,
+            expires_at,
+        )
+    if client is None:
+        return _attach_classification_context(
+            advisory_unavailable("AI_DISABLED"), pre_classifications, expires_at,
+        )
+    ticker = signal.get("ticker", "UNKNOWN")
+    price = signal.get("close", 0)     # FIX: Aligned with models.py
+    target = signal.get("target_1", 0) # FIX: Aligned with models.py
+    stop_loss = signal.get("stop_loss", 0)
+
+    # [WORKFLOW-I.4.D 2026-09-14] Build the CLASSIFIED SENTIMENT DATA
+    # section when the caller supplied pre-classifications. The
+    # section is empty-string when no classifications are supplied
+    # so the f-string template below renders byte-identical to its
+    # pre-I.4.D shape (every existing caller's path).
+    classified_section = _render_classified_section(pre_classifications)
+
+    prompt = f"""
+    You are a cynical, risk-first quantitative trading analyst.
+    Your job is NOT to find reasons to approve trades.
+    Your job is to find reasons to REJECT them.
+    Only approve a trade if the evidence is overwhelmingly clean.
+
+    ===========================================
+    TRADE CONTEXT
+    ===========================================
+    Strategy Type : {signal.get('strategy_type', 'SWING')}
+    Market Regime : {market_regime}
+    Ticker        : {ticker}
+    Entry Price   : Rs{price}
+    Stop Loss     : Rs{stop_loss}
+    Target        : Rs{target}
+    Net EV        : Rs{signal.get('net_ev', 'N/A')}
+    Score         : {signal.get('score', 'N/A')}/100
+    Volume Ratio  : {signal.get('volume_ratio', 'N/A')}x
+    RSI           : {signal.get('rsi_14', 'N/A')}
+    RS Score      : {signal.get('rs_score', 'N/A')} (vs Nifty, 20-day)
+
+    ===========================================
+    REGIME-SPECIFIC INSTRUCTIONS
+    ===========================================
+
+    IF regime is "BEAR_RS_ONLY":
+    Be EXTREMELY cynical. The broad market is falling.
+    This stock is only being evaluated because its math shows
+    outperformance vs the Nifty. Your primary job here is to
+    determine WHY it is outperforming:
+    - Quiet institutional accumulation (VALID) -> keep conviction high
+    - Unverified rumour, single contract win, retail social media hype -> 
+        REDUCE conviction_score below 50 immediately
+    - Short-covering rally in a falling stock -> REDUCE below 40
+    - If you cannot determine a credible structural reason from the
+        sentiment data: REDUCE below 55
+
+    IF strategy is "MOMENTUM" (intraday):
+    Evaluate whether the news/catalyst justifies a 3-hour sustained
+    move, not just a 15-minute spike.
+    - Genuine earnings beat, sector tailwind -> conviction can be high
+    - Single news headline with no follow-through evidence -> max 65
+    - No news at all (pure technical breakout) -> max 70
+    - Negative news despite price rising -> REDUCE below 45
+
+    IF regime is "CAUTION":
+    Apply the same cynicism as BEAR_RS_ONLY but one level less severe.
+    Reduce all scores by 10 points before outputting.
+
+    IF regime is "BULL" and strategy is "SWING":
+    Standard evaluation. Do not manufacture cynicism.
+    Follow the contradiction check rules below.
+
+    ===========================================
+    UNIVERSAL EVALUATION RULES
+    ===========================================
+
+    1. CONTRADICTION CHECK:
+    If sentiment reveals critical legal, regulatory, fraud,
+    accounting irregularity, or catastrophic operational news
+    that contradicts a long position: REDUCE below 35.
+
+    2. NO HALLUCINATION:
+    Base rationale ONLY on the text provided.
+    Do not invent news. Do not cite sources not in the data.
+    If no sentiment data: say so explicitly in rationale.
+
+    3. DO NOT over-react to routine market news.
+    Quarterly results in line with estimates = neutral.
+    Standard analyst upgrades/downgrades = minor adjustment only.
+
+    4. SCORING SCALE:
+    80-100 : Clean setup, sentiment confirms technicals
+    60-79  : Acceptable, standard market risks present
+    50-59  : Marginal, one significant concern exists
+    0-49   : High risk of false positive, do not execute
+
+    ===========================================
+    CLASSIFIED SENTIMENT DATA
+    ===========================================
+    {classified_section if classified_section else
+    "(no pre-classifications supplied; use the raw MULTI-SOURCE SENTIMENT DATA below)"}
+
+    ===========================================
+    MULTI-SOURCE SENTIMENT DATA
+    ===========================================
+    {sentiment_text if sentiment_text else
+    "NO SENTIMENT DATA AVAILABLE. Evaluate on technicals only. "
+    "Apply caution: absence of news for an active signal is unusual. "
+    "Cap conviction at 70 unless regime is BULL."}
+
+    ===========================================
+    OUTPUT FORMAT
+    ===========================================
+    Respond with a SINGLE JSON object and nothing else. No markdown fences,
+    no prose before or after. It must have exactly these fields:
+    {{
+      "conviction_score": <integer 0-100>,
+      "pitch": "<one-line trade thesis>",
+      "rationale": "<why the score, grounded ONLY in the data above>",
+      "risks": "<the main downside / what would invalidate this>"
+    }}
+    """
+    # [LOW-004] Enforce a hard timeout on the MiniMax API call to prevent
+    # blocking the entire synchronous pipeline if the API hangs. The daemon
+    # thread + join(timeout) is a hard wall: even if the SDK's own socket
+    # timeout misbehaves, the poll cannot be held hostage.
+    #
+    # [MINIMAX-TIMEOUT 2026-08-04] The wall was 30s and it was cutting off
+    # calls that were about to succeed. On 2026-08-03 two of three momentum
+    # signals timed out, and both then completed: BHARTIHEXA started at
+    # 12:25:02, the SDK's own 28s timeout fired at 12:25:32, the wall
+    # abandoned the thread at 12:25:34 -- and the orphaned thread got its
+    # 200 OK at 12:26:18. The answer arrived 44 seconds after we stopped
+    # listening, and was discarded.
+    #
+    # Two things were wrong. The SDK was retrying INSIDE the 28s budget, so a
+    # single slow call plus one retry could never fit; and the wall was set as
+    # if 30s were a generous allowance for a reasoning model that spends
+    # output tokens on a <think> block before answering.
+    #
+    # Now: one retry maximum (bounding what an abandoned thread can still
+    # spend), a per-request timeout that fits a slow-but-healthy call, and a
+    # wall wide enough for the retry. The whole budget stays well inside the
+    # 3-minute poll cadence, so a hung call still cannot stall the pipeline.
+    result_holder: Dict = {}
+
+    def _call_minimax():
+        try:
+            # [MINIMAX-MIGRATION 2026-07-15] MiniMax speaks the OpenAI
+            # chat-completions dialect, so the analyst prompt is split into a
+            # short system role (identity + the exact JSON contract) and the
+            # user role (the trade dossier built above). MiniMax has no
+            # Gemini-style server-side schema enforcement, so the contract is
+            # carried in the prompt and validated on the way out (below).
+            resp = client.chat.completions.create(
+                model=MINIMAX_MODEL,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a cynical, risk-first quantitative trading "
+                            "analyst. Respond ONLY with a single JSON object with "
+                            "the fields conviction_score (integer 0-100), pitch "
+                            "(string), rationale (string) and risks (string). "
+                            "Emit no markdown, no code fences and no text outside "
+                            "the JSON object."
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.0,
+                # [MINIMAX-REASONING 2026-07-16] MiniMax-M3 spends output tokens
+                # on a <think> block before the JSON. Give it enough headroom
+                # that the JSON is never truncated mid-reasoning (the other half
+                # of the FIVESTAR unparseable-output fix, alongside the
+                # think-block stripping in _extract_json_object).
+                max_tokens=2048,
+                # Belt-and-braces: the SDK's own request timeout backs up the
+                # thread wall. Kept under the wall so the SDK errors (giving us
+                # a clean log line) before the thread is abandoned.
+                timeout=MINIMAX_REQUEST_TIMEOUT_SEC,
+            )
+            result_holder['response'] = resp
+        except Exception as exc:
+            result_holder['error'] = exc
+
+    minimax_thread = threading.Thread(target=_call_minimax, daemon=True)
+    # [WORKFLOW-I I1 2026-09-13] Capture started_at before the thread
+    # begins. Each return site below uses ``datetime.now(timezone.utc)``
+    # as completed_at, then attaches provenance via ``_attach_provenance``.
+    minimax_thread.start()
+    minimax_thread.join(timeout=MINIMAX_WALL_TIMEOUT_SEC)
+    completed_at = datetime.now(timezone.utc)
+
+    if expires_at is not None and completed_at >= expires_at:
+        return _attach_provenance(
+            advisory_unavailable("review_completed_late"),
+            started_at=started_at, completed_at=completed_at,
+            pre_classifications=pre_classifications, expires_at=expires_at,
+        )
+
+    if minimax_thread.is_alive():
+        logger.error(
+            f"MiniMax timeout ({MINIMAX_WALL_TIMEOUT_SEC}s) for {ticker} - "
+            f"analysis skipped, alert still sent without conviction"
+        )
+        return _attach_provenance(
+            advisory_unavailable(f"timeout_{MINIMAX_WALL_TIMEOUT_SEC}s"),
+            started_at=started_at, completed_at=completed_at,
+            pre_classifications=pre_classifications, expires_at=expires_at,
+        )
+    if 'error' in result_holder:
+        logger.error(f"MiniMax analysis failed for {ticker}: {result_holder['error']}")
+        return _attach_provenance(
+            advisory_unavailable("api_error"),
+            started_at=started_at, completed_at=completed_at,
+            pre_classifications=pre_classifications, expires_at=expires_at,
+        )
+
+    # [ROADMAP-4.7 2026-07-13, carried through MiniMax migration] This is the
+    # ONE place in the system where a third party's free-text output is parsed.
+    # An LLM can return prose, a fenced ```json block, a truncated object or an
+    # object missing a field, and any of those must NOT raise out of the
+    # conviction gate -- a single malformed reply once killed every EXEC alert
+    # in the batch (the 2026-07-10 HUDCO stall shape).
+    #
+    # So: extract the JSON defensively, then validate against SignalOutput. On
+    # ANY failure return None -- the callers treat a None analysis as "AI
+    # failed, manual review required" and STILL send the alert with a SYSTEM
+    # FALLBACK banner. Losing the AI opinion must never lose the trade.
+    response = result_holder['response']
+    try:
+        content = response.choices[0].message.content
+    except (AttributeError, IndexError, TypeError) as e:
+        logger.error(f"MiniMax response had no content for {ticker}: {e}")
+        return _attach_provenance(
+            advisory_unavailable("empty_response"),
+            started_at=started_at, completed_at=completed_at,
+            pre_classifications=pre_classifications, expires_at=expires_at,
+        )
+
+    data = _extract_json_object(content)
+    if data is None:
+        preview = (content or "")[:200]
+        logger.error(
+            f"MiniMax returned unparseable output for {ticker} -- proceeding "
+            f"without analysis. First 200 chars: {preview!r}"
+        )
+        return _attach_provenance(
+            advisory_unavailable("unparseable_output"),
+            started_at=started_at, completed_at=completed_at,
+            pre_classifications=pre_classifications, expires_at=expires_at,
+        )
+
+    try:
+        return _attach_provenance(
+            review_from_payload(SignalOutput(**data).model_dump()),
+            started_at=started_at, completed_at=completed_at,
+            pre_classifications=pre_classifications, expires_at=expires_at,
+        )
+    except (ValidationError, TypeError) as e:
+        preview = (content or "")[:200]
+        logger.error(
+            f"MiniMax output for {ticker} did not match schema: {e} -- "
+            f"proceeding without analysis. First 200 chars: {preview!r}"
+        )
+        return _attach_provenance(
+            advisory_unavailable("schema_mismatch"),
+            started_at=started_at, completed_at=completed_at,
+            pre_classifications=pre_classifications, expires_at=expires_at,
+        )
+
+
+def _optional_review_key(
+    signal: Dict,
+    sentiment_text: str,
+    market_regime: str,
+    pre_classifications: Optional[List["ClassificationResult"]] = None,
+) -> str:
+    """Bind a cache entry to immutable decision fields and its event evidence."""
+    decision = {
+        "ticker": signal.get("ticker"), "signal_time": signal.get("signal_time"),
+        "strategy_type": signal.get("strategy_type"), "close": signal.get("close"),
+        "target_1": signal.get("target_1"), "stop_loss": signal.get("stop_loss"),
+        "market_regime": market_regime,
+    }
+    event_digest = hashlib.sha256(str(sentiment_text).encode("utf-8")).hexdigest()
+    cache_identity = {"decision": decision, "event_digest": event_digest}
+    # Preserve the exact legacy key when classification is disabled (None).
+    # Enabled classification, including an explicitly empty result set, gets
+    # a deterministic context digest so changed evidence cannot reuse a prior
+    # model opinion.
+    if pre_classifications is not None:
+        cache_identity["classification_context_sha256"] = (
+            news_classifier.classification_context_sha256(pre_classifications)
+        )
+    payload = json.dumps(cache_identity, sort_keys=True, default=str,
+                         separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _get_optional_ai_queue() -> Optional[AsyncReviewQueue]:
+    """Return the non-blocking worker only when it cannot weaken a hard gate."""
+    global _optional_ai_queue
+    if not MINIMAX_ASYNC_REVIEW_ENABLED:
+        return None
+    if MINIMAX_UNAVAILABLE_POLICY != "proceed" or MOMENTUM_MINIMAX_REJECT_POLICY == "block":
+        logger.warning(
+            "optional_ai_queue_disabled_by_blocking_policy unavailable_policy=%s momentum_reject_policy=%s",
+            MINIMAX_UNAVAILABLE_POLICY, MOMENTUM_MINIMAX_REJECT_POLICY,
+        )
+        return None
+    if _optional_ai_queue is None:
+        _optional_ai_queue = AsyncReviewQueue(
+            analyze_with_minimax,
+            max_pending=MINIMAX_ASYNC_REVIEW_MAX_PENDING,
+            max_requests_per_day=MINIMAX_ASYNC_REVIEW_DAILY_BUDGET,
+        )
+    return _optional_ai_queue
+
+
+def optional_ai_status() -> Dict:
+    """Expose optional-AI health without making it a trading control plane."""
+    policy_allows_annotation = (
+        MINIMAX_UNAVAILABLE_POLICY == "proceed"
+        and MOMENTUM_MINIMAX_REJECT_POLICY != "block"
+    )
+    queue_snapshot = _optional_ai_queue.snapshot() if _optional_ai_queue is not None else {
+        "pending": 0, "cached": 0, "daily_requests": 0,
+        "daily_budget": MINIMAX_ASYNC_REVIEW_DAILY_BUDGET,
+        "max_pending": MINIMAX_ASYNC_REVIEW_MAX_PENDING,
+        "circuit_state": "CLOSED",
+    }
+    if client is None:
+        state, reason = "DISABLED_NO_CREDENTIAL", "AI_DISABLED"
+    elif not MINIMAX_ASYNC_REVIEW_ENABLED:
+        state, reason = "DISABLED_BY_CONFIGURATION", "async_annotation_disabled"
+    elif not policy_allows_annotation:
+        state, reason = "DISABLED_BY_POLICY", "configured_hard_veto"
+    elif queue_snapshot["circuit_state"] == "OPEN":
+        state, reason = "OUTAGE_CIRCUIT_OPEN", "provider_failures"
+    else:
+        state, reason = "READY", "optional_annotation_ready"
+    payload: Dict = {
+        "state": state, "reported_at": datetime.now(timezone.utc).isoformat(),
+        "async_requested": MINIMAX_ASYNC_REVIEW_ENABLED,
+        "policy_allows_annotation": policy_allows_annotation,
+        "reason": reason, "queue": queue_snapshot,
+    }
+    # [WORKFLOW-I I.A 2026-09-13] Bridge I3 usefulness metrics to the
+    # engine when the operator opts in. The envelope is built only
+    # when the queue exists (the agent has actually been processing
+    # reviews) so a never-used agent never publishes zeros that
+    # masquerade as data. The flag is the rollback path: setting
+    # ``OPTIONAL_AI_REPORT_USEFULNESS=false`` (the default) drops
+    # the field without code change.
+    if OPTIONAL_AI_REPORT_USEFULNESS and _optional_ai_queue is not None:
+        payload["usefulness"] = _optional_ai_queue.usefulness_snapshot()
+    return payload
+
+
+def publish_optional_ai_status() -> None:
+    """Report health asynchronously; a status outage must not delay trading."""
+    if not INTERNAL_API_SECRET:
+        return
+    payload = optional_ai_status()
+
+    def _post() -> None:
+        try:
+            response = requests.post(
+                OPTIONAL_AI_STATUS_URL, json=payload,
+                headers={"X-Internal-Secret": INTERNAL_API_SECRET}, timeout=2,
+            )
+            if response.status_code >= 300:
+                logger.warning("optional_ai_status_publish_failed status=%s", response.status_code)
+        except requests.RequestException as exc:
+            logger.warning("optional_ai_status_publish_failed error=%s", type(exc).__name__)
+
+    threading.Thread(target=_post, name="optional-ai-status", daemon=True).start()
+
+
+def queue_optional_ai_review(
+    signal: Dict,
+    sentiment_text: str,
+    market_regime: str,
+    pre_classifications: Optional[List["ClassificationResult"]] = None,
+) -> Optional[Review]:
+    """Queue a momentum-only annotation, returning immediately to the alert path.
+
+    ``None`` means the caller must retain its existing synchronous policy.
+    A pending or dropped review is represented explicitly in the operator
+    alert; it is never mistaken for approval and cannot mutate signal numbers.
+
+    [WORKFLOW-I.4.D 2026-09-14] Optional ``pre_classifications``:
+    forwarded to ``analyze_with_minimax`` when the queued review
+    runs. ``None`` (the default, and every pre-I.4.D caller's
+    path) preserves the existing verdict-prompt shape. When the
+    caller passes a non-None list, the queue's task carries it
+    through and the reviewer renders the CLASSIFIED SENTIMENT
+    DATA section in its prompt. The list is captured by
+    reference (the queue does not mutate it).
+    """
+    if client is None:
+        return advisory_unavailable("AI_DISABLED")
+    queue = _get_optional_ai_queue()
+    if queue is None:
+        return None
+    requested_expiry = (
+        datetime.now(timezone.utc)
+        + timedelta(seconds=MINIMAX_ASYNC_REVIEW_DEADLINE_SEC)
+    )
+    review_expires_at = _effective_classification_expiry(
+        pre_classifications, requested_expiry,
+    )
+    submission = queue.submit(
+        _optional_review_key(
+            signal, sentiment_text, market_regime, pre_classifications,
+        ), signal,
+        sentiment_text, market_regime,
+        pre_classifications=pre_classifications,
+        expires_at=review_expires_at,
+    )
+    if submission.review is not None:
+        return submission.review
+    reasons = {
+        "QUEUED": "AI_REVIEW_PENDING", "PENDING": "AI_REVIEW_PENDING",
+        "QUEUE_FULL": "AI_REVIEW_QUEUE_FULL", "BUDGET_EXHAUSTED": "AI_REVIEW_BUDGET_EXHAUSTED",
+        "CIRCUIT_OPEN": "AI_REVIEW_CIRCUIT_OPEN", "EXPIRED": "AI_REVIEW_EXPIRED",
+    }
+    return _attach_classification_context(
+        advisory_unavailable(
+            reasons.get(submission.state, "AI_REVIEW_UNAVAILABLE")
+        ),
+        pre_classifications,
+        review_expires_at,
+    )
+
+def send_telegram_alert(signal: Dict, review: "Review"):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    
+    ticker = signal.get("ticker", "UNKNOWN")
+    price = signal.get("close")     # FIX: Aligned with models.py
+    target = signal.get("target_1") # FIX: Aligned with models.py
+    sl = signal.get("stop_loss")
+    sig_id = ticker                 # FIX: Deduplication ID is now the ticker
+    
+    analysis = review.payload
+    if not review.available:
+        # [ADVISORY 2026-08-05] Name the specific failure. "AI analysis failed"
+        # covered a 100s timeout and a malformed JSON reply identically, and
+        # the operator could not tell which risk they were accepting.
+        text = (f"🚨 **SYSTEM FALLBACK: {ticker}** 🚨\n"
+                f"Price: {price} | TGT: {target} | SL: {sl}\n"
+                f"⚠️ {review.banner()}. Manual review required.")
+    else:
+        text = f"📊 **TRADE ALERT: {ticker}**\n\n**Metrics:** Price: {price} | TGT: {target} | SL: {sl}\n**Conviction Score:** {analysis.get('conviction_score', 'N/A')}/100\n\n**Pitch:**\n{analysis.get('pitch', 'N/A')}\n\n**Rationale:**\n{analysis.get('rationale', 'N/A')}\n\n**Risks:**\n{analysis.get('risks', 'N/A')}"
+
+    # [CRIT-001/002] Unified callback format: ACTION:signal_id:unix_ts
+    # Keeps payload well under Telegram's 64-byte callback_data limit.
+    # Action EXEC matches the handler in node-gateway/server/index.js.
+    safe_sig_id = str(sig_id)[:40]
+    ts = int(time.time())
+
+    # [HIGH-007 2026-07-13] Register BEFORE the button exists. If the operator
+    # can press it, the snapshot behind it must already be on disk.
+    register_approved_snapshot(safe_sig_id, ticker, "EXEC", signal)
+
+    keyboard = {
+        "inline_keyboard": [
+            [
+                {"text": "✅ EXECUTE", "callback_data": f"EXEC:{safe_sig_id}:{ts}"},
+                {"text": "❌ REJECT",  "callback_data": f"REJ:{safe_sig_id}:{ts}"}
+            ]
+        ]
+    }
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown", "reply_markup": json.dumps(keyboard)}
+    try:
+        res = requests.post(url, json=payload, timeout=10)
+        res.raise_for_status()
+        logger.info(f"Successfully sent Telegram alert for {ticker}")
+    except Exception as e:
+        logger.error(f"Failed to send Telegram alert for {ticker}: {e}")
+
+# -------------------------------------------------------------------------
+# PIPELINE ORCHESTRATION
+# -------------------------------------------------------------------------
+def system_health_check(event_type: str):
+    logger.info(f"Running {event_type} heartbeat check...")
+    health_url = QUANT_ENGINE_URL.replace("/signals", "/health")
+    
+    try:
+        # Interrogate the Python Engine
+        res = requests.get(health_url, timeout=5)
+        res.raise_for_status()
+        
+        if event_type == "OPEN":
+            msg = "✅ **MARKET OPEN**\nTrading Sentinel is ONLINE.\nQuant Engine: ✅ Healthy\nAgent: ✅ Active\nReady to hunt. 🦅"
+        else:
+            msg = "🛑 **MARKET CLOSED**\nTrading Sentinel is SLEEPING.\nQuant Engine: ✅ Survived the day\nSee you tomorrow. 🌙"
+
+    except Exception as e:
+        # The Engine is dead or unreachable
+        msg = f"🚨 **CRITICAL SYSTEM FAILURE** 🚨\nEvent: {event_type}\nError: Quant Engine Unreachable!\nDetails: `{e}`\n⚠️ Wake up and check Docker!"
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"}
+    try:
+        requests.post(url, json=payload, timeout=10)
+    except Exception as e:
+        logger.error(f"Failed to send heartbeat to Telegram: {e}")
+
+MOMENTUM_ENGINE_URL = os.getenv(
+    "QUANT_ENGINE_URL", "http://python-engine:8000"
+).replace("/signals", "") + "/momentum-signals"
+
+def run_momentum_pipeline():
+    """Poll Container B momentum signals and process them."""
+    # [POLL-CADENCE 2026-08-04] The 3-minute schedule is a bare interval, so it
+    # fires around the clock. Gate here rather than building a weekday grid --
+    # same pattern as check_engine_liveness. Silent on purpose: at 3-minute
+    # spacing an out-of-hours log line would be ~470 lines of noise a day.
+    if not _is_market_hours():
+        return
+    logger.info("Starting momentum signal pipeline...")
+    try:
+        resp = requests.get(MOMENTUM_ENGINE_URL, timeout=10)
+        resp.raise_for_status()
+        data           = resp.json()
+        signals        = data.get("signals", [])
+        regime         = data.get("market_regime", "UNKNOWN")
+        momentum_pool  = data.get("momentum_pool", 0)
+    except Exception as e:
+        logger.error(f"Failed to fetch momentum signals: {e}")
+        return
+
+    if not signals:
+        return
+
+    for signal in signals:
+        ticker  = signal.get("ticker")
+        sig_id  = f"{ticker}_MOM"   # prevent collision with swing dedup
+
+        if not ticker:
+            continue
+        if sig_id in processed_signals_today:
+            logger.info(f"Momentum signal {sig_id} already processed. Skipping.")
+            continue
+
+        # [POLL-CADENCE 2026-08-04] /momentum-signals is cumulative for the
+        # day, so a restart mid-session re-presents every signal since 09:15.
+        # The engine already marks anything over 30 minutes old `stale_data`
+        # and, until now, nothing read it. A momentum breakout has either
+        # worked or failed within 30 minutes -- alerting one at that age
+        # invites an entry at a price the setup no longer describes.
+        if signal.get("stale_data"):
+            logger.info(
+                f"Momentum {ticker} dropped: signal is stale "
+                f"(>30 min old), the setup no longer describes the price."
+            )
+            mark_processed(sig_id)
+            continue
+
+        # [FIX 2026-07-11 STALL] Isolate each signal. On 2026-07-10 the
+        # loop died after COCHINSHIP and HUDCO (same snapshot) was never
+        # processed -- one raised exception killed every signal after it
+        # in the batch. On failure the signal is NOT marked processed, so
+        # the next poll retries it (bounded: polls run every 15 min).
+        touch_heartbeat()  # [ROADMAP-2.2] progressing, not hung
+        try:
+            sentiment_text, pre_classifications = _collect_news_context(ticker)
+            # [WORKFLOW-I.4.D 2026-09-14] Opt-in classification:
+            # when ENABLE_NEWS_CLASSIFIER=1, classify the news
+            # batch and pass the classifications to BOTH the
+            # async queue and the synchronous fallback. When the
+            # env flag is off (the default), returns None and
+            # both paths consume raw sentiment_text exactly as
+            # before. See _maybe_classify_news for the contract.
+            review = queue_optional_ai_review(
+                signal, sentiment_text, regime,
+                pre_classifications=pre_classifications,
+            )
+            if review is None:
+                # Preserve the existing synchronous hard-veto behaviour when
+                # the operator explicitly configured a blocking AI policy.
+                review = analyze_with_minimax(
+                    signal, sentiment_text, regime,
+                    pre_classifications=pre_classifications,
+                    expires_at=(
+                        datetime.now(timezone.utc)
+                        + timedelta(seconds=MINIMAX_ASYNC_REVIEW_DEADLINE_SEC)
+                    ),
+                )
+
+            hard_reject = (
+                review.verdict is Verdict.REJECT
+                and MOMENTUM_MINIMAX_REJECT_POLICY == "block"
+            )
+            unavailable_block = (
+                review.verdict is Verdict.REVIEW_UNAVAILABLE
+                and review.blocks(
+                    unavailable_policy=MINIMAX_UNAVAILABLE_POLICY
+                )
+            )
+            if hard_reject or unavailable_block:
+                logger.info(f"Momentum {ticker} blocked: {review.verdict.value} "
+                            f"conviction={review.conviction} reason={review.reason}")
+                # [FIX 2026-07-11 SILENT-VETO] Tell the operator. Before
+                # this, a Gemini veto was invisible: the engine's summary
+                # said "accepted" but no button alert ever arrived.
+                send_conviction_veto_notice(signal, review)
+                mark_processed(sig_id)
+                continue
+
+            if review.verdict is Verdict.REJECT:
+                logger.info(
+                    f"Momentum {ticker} AI rejection shown as advisory: "
+                    f"conviction={review.conviction}; deterministic risk "
+                    "controls and operator approval remain authoritative."
+                )
+
+            send_momentum_telegram_alert(signal, review, momentum_pool)
+            mark_processed(sig_id)
+        except Exception as e:
+            logger.error(
+                f"Momentum pipeline error for {ticker} (will retry next "
+                f"poll): {e}", exc_info=True
+            )
+        time.sleep(2)
+
+def send_conviction_veto_notice(signal: Dict, review: "Review"):
+    """Plain informational message (no buttons) when the MiniMax gate
+    blocks an engine-accepted momentum signal. Failures are logged and
+    swallowed -- the veto notice must never break the pipeline."""
+    url    = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    ticker = signal.get("ticker", "UNKNOWN")
+    analysis = review.payload
+    text = (f"🧠 MOMENTUM BLOCKED: {ticker}\n"
+            f"Engine accepted. {review.banner()} - no EXEC button sent.\n"
+            f"Rationale: {analysis.get('rationale', 'N/A')}")
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
+    try:
+        res = requests.post(url, json=payload, timeout=10)
+        res.raise_for_status()
+        logger.info(f"Conviction veto notice sent: {ticker}")
+    except Exception as e:
+        logger.error(f"Conviction veto notice failed: {ticker}: {e}")
+
+def send_momentum_telegram_alert(
+    signal: Dict, review: "Review", momentum_pool: float
+):
+    """Send a distinct, plain-text INTRADAY alert.
+
+    The MiniMax pitch/risk fields are untrusted free text.  Telegram's
+    Markdown parser rejects otherwise-valid messages containing characters
+    such as ``<``, ``_`` and unmatched brackets.  This path therefore uses
+    Telegram's default plain-text mode.  Delivery errors deliberately escape
+    to ``run_momentum_pipeline`` so it does not persist the dedup id and the
+    next poll retries the alert.
+    """
+    url    = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    ticker = signal.get("ticker", "UNKNOWN")
+    price  = signal.get("close")
+    target = signal.get("target_1")
+    sl     = signal.get("stop_loss")
+    vwap   = signal.get("vwap")
+    ptype  = signal.get("product_type", "MIS")
+    ratio  = signal.get("cost_ratio", 0)
+
+    header = f"⚡ INTRADAY MOMENTUM: {ticker} ({ptype})"
+
+    # [POLL-CADENCE 2026-08-04] Show how old the signal already is. The prices
+    # below were computed off a 15-min bar close; every minute between that
+    # close and the EXEC press moves the fill away from them. The executor
+    # re-anchors the stop to the actual fill so the risk stays correct, but the
+    # operator still needs to see that a 9-minute-old breakout is a different
+    # proposition from a 1-minute-old one.
+    age_line = ""
+    sig_ts = signal.get("signal_time")
+    if sig_ts:
+        try:
+            from datetime import datetime as _dt, timezone as _tz
+            parsed = _dt.fromisoformat(str(sig_ts).replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=_tz.utc)
+            age_min = (_dt.now(_tz.utc) - parsed).total_seconds() / 60.0
+            flag = " ⏳" if age_min >= 10 else ""
+            age_line = f"Signal age: {age_min:.0f} min{flag}\n"
+        except Exception:
+            # A malformed timestamp must never suppress the alert itself.
+            age_line = ""
+
+    analysis = review.payload
+    advisory_line = ""
+    if review.verdict is Verdict.REJECT:
+        advisory_line = (
+            "WARNING: AI conviction is low. This is an advisory; "
+            "execute only after manual review.\n"
+        )
+    if not review.available:
+        text = (f"{header}\n"
+                f"{age_line}"
+                f"Price: Rs{price} | VWAP: Rs{vwap}\n"
+                f"Target: Rs{target} | SL: Rs{sl}\n"
+                f"⚠️ {review.banner()}. Manual review required.\n"
+                f"Auto-square starts at 15:13 IST (hard submit cutoff 15:14:30).")
+    else:
+        text = (f"{header}\n\n"
+                f"{age_line}"
+                f"{advisory_line}"
+                f"Entry: Rs{price} | VWAP: Rs{vwap}\n"
+                f"Target: Rs{target} | SL: Rs{sl}\n"
+                f"Cost ratio: {ratio:.1%} of expected profit\n"
+                f"{review.banner()}\n\n"
+                f"Pitch: {analysis.get('pitch', 'N/A')}\n"
+                f"Risk: {analysis.get('risks', 'N/A')}\n\n"
+                f"⚠️ INTRADAY: Auto-square starts at 15:13 IST with a 15:14:30 hard submit cutoff, regardless of P&L.")
+
+    # [CRIT-001/002] Unified callback format: ACTION:signal_id:unix_ts
+    sig_id = f"{ticker}_MOM"[:40]
+    ts = int(time.time())
+
+    # [HIGH-007 2026-07-13] Register BEFORE the button exists. The engine's
+    # momentum list lives only in memory -- a restart wipes it and the press
+    # then dies with "Momentum signal not found in Engine state". This row is
+    # on disk and survives that.
+    register_approved_snapshot(sig_id, ticker, "EM", signal)
+
+    keyboard = {
+        "inline_keyboard": [[
+            {"text": "✅ EXECUTE INTRADAY",
+             "callback_data": f"EM:{sig_id}:{ts}"},
+            {"text": "❌ REJECT",
+             "callback_data": f"REJ:{sig_id}:{ts}"}
+        ]]
+    }
+    payload = {
+        "chat_id":      TELEGRAM_CHAT_ID,
+        "text":         text,
+        "reply_markup": json.dumps(keyboard)
+    }
+    try:
+        res = requests.post(url, json=payload, timeout=10)
+        res.raise_for_status()
+        logger.info(f"Momentum Telegram sent: {ticker}")
+    except Exception as e:
+        # requests' HTTPError includes the request URL, and Telegram embeds
+        # the live bot token in that URL.  Raise only a redacted exception:
+        # the caller logs it (with traceback) and leaves the signal unmarked
+        # so it is retried on the next poll.
+        safe_error = str(e)
+        if TELEGRAM_BOT_TOKEN:
+            safe_error = safe_error.replace(str(TELEGRAM_BOT_TOKEN), "<redacted>")
+        safe_error = re.sub(
+            r"(?i)(/bot)[^/\s?]+", r"\1<redacted>", safe_error
+        )
+        raise RuntimeError(
+            f"Momentum Telegram delivery failed for {ticker}: {safe_error}"
+        ) from None
+
+def run_pipeline():
+    # Fetch regime from Container B health/signals endpoint
+    logger.info("Starting scheduled signal pipeline...")
+    try:
+        resp = requests.get(
+            QUANT_ENGINE_URL, timeout=10
+        )
+        data       = resp.json()
+        signals    = data.get("signals", [])
+        regime     = data.get("market_regime", "UNKNOWN")
+    except Exception as e:
+        logger.error(f"Failed to fetch signals: {e}")
+        return
+    
+    if not signals:
+        logger.info("No signals found or Quant Engine unreachable. Pipeline sleeping.")
+        return
+
+    for signal in signals:
+        ticker = signal.get("ticker")
+        sig_id = ticker # FIX: Use ticker for deduplication
+        
+        if not ticker: continue
+            
+        if sig_id in processed_signals_today:
+            logger.info(f"Signal {sig_id} already processed today. Skipping.")
+            continue
+            
+        logger.info(f"Processing signal for {ticker}...")
+        touch_heartbeat()  # [ROADMAP-2.2] progressing, not hung
+        # [FIX 2026-07-11 STALL] Same per-signal isolation as the momentum
+        # pipeline: one bad ticker must not kill the rest of the batch.
+        try:
+            sentiment_text, pre_classifications = _collect_news_context(ticker)
+            # [WORKFLOW-I.4.D 2026-09-14] Opt-in classification
+            # (see _maybe_classify_news for the env-flag contract).
+            review = analyze_with_minimax(
+                signal, sentiment_text, regime,
+                pre_classifications=pre_classifications,
+                expires_at=(
+                    datetime.now(timezone.utc)
+                    + timedelta(seconds=MINIMAX_ASYNC_REVIEW_DEADLINE_SEC)
+                ),
+            )
+
+            if review.blocks(unavailable_policy=MINIMAX_UNAVAILABLE_POLICY):
+                logger.info(f"Skipped {ticker}: {review.verdict.value} "
+                            f"conviction={review.conviction} reason={review.reason}")
+                mark_processed(sig_id)
+                continue
+
+            send_telegram_alert(signal, review)
+            mark_processed(sig_id)
+        except Exception as e:
+            logger.error(
+                f"Swing pipeline error for {ticker} (will retry next run): {e}",
+                exc_info=True
+            )
+        time.sleep(2)
+        
+    logger.info("Pipeline run complete.")
+def main():
+    logger.info("Container C (Intelligence Orchestrator) started.")
+    logger.info("System configured for Asia/Kolkata timezone.")
+
+    # [ROADMAP-4.7 2026-07-13] Restore today's already-alerted signals BEFORE
+    # the first poll, or the restart we are trying to survive re-alerts them
+    # in the very next cycle.
+    _load_dedup_state()
+    
+    # Brute-force distinct alarm generation
+    days = ["monday", "tuesday", "wednesday", "thursday", "friday"]
+    
+    for day in days:
+        # getattr() creates a BRAND NEW schedule object for every single line
+        getattr(schedule.every(), day).at("09:15").do(system_health_check, event_type="OPEN")
+        getattr(schedule.every(), day).at("09:25").do(run_pipeline)
+        getattr(schedule.every(), day).at("14:50").do(run_pipeline)
+        getattr(schedule.every(), day).at("15:30").do(system_health_check, event_type="CLOSE")
+
+    schedule.every().day.at("00:00").do(clear_memory)
+    # [POLL-CADENCE 2026-08-04] Was a fixed :10/:25/:40/:55 grid, chosen in
+    # July when scans took 5.6-9.1 min. Scans finished faster than that on
+    # 2026-08-03 and the grid became pure dead time: SUMICHEM was accepted at
+    # 11:02:58 and alerted at 11:10:07, BHARTIHEXA 12:17:58 -> 12:25:34,
+    # TRITURBINE 14:48:03 -> 14:55:39. That is 7.1-7.6 minutes of latency the
+    # operator pays before even seeing the button, and up to 15 in the worst
+    # case, stacked on top of a scanner that already runs on 15-min bars.
+    #
+    # Latency is not cosmetic here. It moves the fill away from the price the
+    # signal was built on, and until the FILL-ANCHOR fix landed that silently
+    # rewrote the trade's risk. It still costs real edge: SUMICHEM's entry
+    # drifted -0.37% in those minutes, which on a 0.5% stop is most of the
+    # move the signal was trying to catch.
+    #
+    # A 3-minute market-hours poll caps the agent's contribution at 3 min. The
+    # endpoint is a cheap cumulative read, processed_signals_today dedupes, and
+    # MiniMax only runs for signals that are actually new -- so the extra polls
+    # cost one HTTP GET each and nothing else.
+    schedule.every(MOMENTUM_POLL_INTERVAL_MIN).minutes.do(run_momentum_pipeline)
+
+    # Status is separate from the decision path: publishing it never waits for
+    # the engine and a failed report leaves deterministic alerts untouched.
+    schedule.every(1).minutes.do(publish_optional_ai_status)
+
+    # [WORKFLOW-I.4.E.CRON_WIRING 2026-09-14] Hourly contract-health
+    # self-policing. The I.4.E bounded invariants (status envelope
+    # authority, no prompt leakage, usefulness counters only,
+    # classifier fail-closed, review non-authoritative) are the
+    # "guard the guards" discipline -- without a cron, they only
+    # run when the operator remembers to invoke the CLI. Hourly
+    # cadence is enough: status envelope shape doesn't drift
+    # minute-to-minute, and the check is O(1) (no broker / model
+    # / filesystem calls). On any violation, the tick fires a
+    # Telegram alert so the operator sees the drift immediately.
+    # The tick is fire-and-forget; a contract-health failure must
+    # NEVER block the agent's main loop.
+    from contract_health_cron import contract_health_cron_tick
+
+    def _contract_health_cron_safe():
+        # Defensive wrapper: the tick already handles its own
+        # try/except internally, but a second layer here means
+        # ANY exception (import failure, scheduler-side bug) is
+        # contained. The agent's main loop is the priority.
+        try:
+            contract_health_cron_tick(
+                status_envelope=optional_ai_status(),
+            )
+        except Exception:  # pragma: no cover - defensive
+            logger.warning(
+                "contract_health_cron_tick_unhandled",
+                exc_info=True,
+            )
+
+    schedule.every(1).hours.do(_contract_health_cron_safe)
+
+    # [ROADMAP-2.4 2026-07-12] Engine loop-progress watchdog (self-gates
+    # to market hours; alerts when /data/scheduler_tick.json goes stale).
+    schedule.every(5).minutes.do(check_engine_liveness)
+
+    publish_optional_ai_status()
+    touch_heartbeat()  # [ROADMAP-2.2] healthy from the first HEALTHCHECK
+    while True:
+        schedule.run_pending()
+        touch_heartbeat()  # [ROADMAP-2.2] main loop alive
+        time.sleep(30)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,908 @@
+{
+  "jobs": [
+    {
+      "func": "_enforce_circuit_breakers_safe",
+      "id": "circuit_breaker_enforce",
+      "kwargs": [],
+      "trigger": "interval[0:02:00]"
+    },
+    {
+      "func": "_run_fno_accept_watchdog_safe",
+      "id": "fno_accept_watchdog",
+      "kwargs": [],
+      "trigger": "cron[hour='15', minute='45']"
+    },
+    {
+      "func": "_run_fno_hourly_report_safe",
+      "id": "fno_hourly_report",
+      "kwargs": [],
+      "trigger": "cron[minute='0']"
+    },
+    {
+      "func": "_run_fno_tick_safe",
+      "id": "fno_tick",
+      "kwargs": [],
+      "trigger": "interval[0:01:30]"
+    },
+    {
+      "func": "_run_partner_analytics_tick_safe",
+      "id": "partner_analytics_tick",
+      "kwargs": [],
+      "trigger": "cron[minute='2-57/5']"
+    },
+    {
+      "func": "_run_partner_eod_wrap_safe",
+      "id": "partner_eod_wrap",
+      "kwargs": [],
+      "trigger": "cron[hour='15', minute='40']"
+    },
+    {
+      "func": "_run_partner_hedge_delivery_recovery_safe",
+      "id": "partner_hedge_delivery_recovery",
+      "kwargs": [],
+      "trigger": "cron[minute='*/2', second='35']"
+    },
+    {
+      "func": "_run_partner_hedge_eod_summary_safe",
+      "id": "partner_hedge_eod_summary",
+      "kwargs": [],
+      "trigger": "cron[hour='15', minute='40']"
+    },
+    {
+      "func": "_run_partner_hedge_morning_summary_safe",
+      "id": "partner_hedge_morning_summary",
+      "kwargs": [],
+      "trigger": "cron[hour='9', minute='50']"
+    },
+    {
+      "func": "_run_partner_hedge_phase2_tick_safe",
+      "id": "partner_hedge_phase2_tick",
+      "kwargs": [],
+      "trigger": "cron[hour='9-15', minute='3,33', second='20']"
+    },
+    {
+      "func": "_run_partner_hedge_phase3_tick_safe",
+      "id": "partner_hedge_phase3_tick",
+      "kwargs": [],
+      "trigger": "cron[hour='9-15', minute='11,41', second='50']"
+    },
+    {
+      "func": "_run_partner_hedge_tick_safe",
+      "id": "partner_hedge_tick",
+      "kwargs": [],
+      "trigger": "cron[minute='7-52/15', second='10']"
+    },
+    {
+      "func": "_run_partner_input_refresh_safe",
+      "id": "partner_input_refresh",
+      "kwargs": [],
+      "trigger": "cron[minute='*/2', second='5']"
+    },
+    {
+      "func": "_run_partner_manual_advisory_lifecycle_tick_safe",
+      "id": "partner_manual_advisory_lifecycle_tick",
+      "kwargs": [],
+      "trigger": "cron[minute='*/1', second='5']"
+    },
+    {
+      "func": "_run_partner_manual_advisory_tick_safe",
+      "id": "partner_manual_advisory_tick",
+      "kwargs": [],
+      "trigger": "cron[minute='*/2', second='50']"
+    },
+    {
+      "func": "_run_partner_morning_brief_safe",
+      "id": "partner_morning_brief",
+      "kwargs": [],
+      "trigger": "cron[hour='9', minute='50']"
+    },
+    {
+      "func": "_run_partner_rv_refresh_safe",
+      "id": "partner_rv_refresh",
+      "kwargs": [],
+      "trigger": "cron[hour='9', minute='10']"
+    },
+    {
+      "func": "_run_partner_scan_tick_safe",
+      "id": "partner_scan_tick",
+      "kwargs": [],
+      "trigger": "cron[minute='*/2', second='40']"
+    },
+    {
+      "func": "_run_penny_accept_watchdog_safe",
+      "id": "penny_accept_watchdog",
+      "kwargs": [],
+      "trigger": "cron[hour='15', minute='45']"
+    },
+    {
+      "func": "_run_penny_daily_attribution",
+      "id": "penny_daily_attribution",
+      "kwargs": [],
+      "trigger": "cron[hour='15', minute='30']"
+    },
+    {
+      "func": "_run_penny_edge_exit_safe",
+      "id": "penny_edge_exit",
+      "kwargs": [],
+      "trigger": "cron[hour='15', minute='15']"
+    },
+    {
+      "func": "_run_penny_edge_scan_safe",
+      "id": "penny_edge_scan",
+      "kwargs": [],
+      "trigger": "cron[hour='9', minute='30']"
+    },
+    {
+      "func": "_run_penny_eod_digest",
+      "id": "penny_eod_digest",
+      "kwargs": [],
+      "trigger": "cron[hour='16', minute='0']"
+    },
+    {
+      "func": "_run_penny_heatmap",
+      "id": "penny_heatmap",
+      "kwargs": [],
+      "trigger": "interval[0:15:00]"
+    },
+    {
+      "func": "_run_penny_premarket_report",
+      "id": "penny_premarket_report",
+      "kwargs": [],
+      "trigger": "cron[hour='7', minute='50']"
+    },
+    {
+      "func": "_run_proactive_shadow_workflow_safe",
+      "id": "proactive_shadow_workflow",
+      "kwargs": [],
+      "trigger": "cron[minute='*/5', second='55']"
+    },
+    {
+      "func": "_run_research_quote_collection_safe",
+      "id": "research_quote_collection",
+      "kwargs": [],
+      "trigger": "cron[minute='*/1', second='25']"
+    },
+    {
+      "func": "bootstrap_0800_job",
+      "id": "daily_bootstrap_0800",
+      "kwargs": [],
+      "trigger": "cron[hour='8', minute='0']"
+    },
+    {
+      "func": "bootstrap_safety_tick",
+      "id": "daily_bootstrap_tick",
+      "kwargs": [],
+      "trigger": "interval[0:10:00]"
+    },
+    {
+      "func": "premarket_login_nudge",
+      "id": "premarket_login_nudge",
+      "kwargs": [],
+      "trigger": "cron[hour='7', minute='50']"
+    },
+    {
+      "func": "run_penny_connors_scan",
+      "id": "penny_connors_scan",
+      "kwargs": [],
+      "trigger": "cron[hour='9', minute='30']"
+    },
+    {
+      "func": "run_penny_eod_check",
+      "id": "penny_eod_check",
+      "kwargs": [],
+      "trigger": "cron[hour='14', minute='30']"
+    },
+    {
+      "func": "run_penny_force_close_mis",
+      "id": "penny_force_close_mis",
+      "kwargs": [],
+      "trigger": "cron[hour='15', minute='0']"
+    },
+    {
+      "func": "run_penny_hourly_report_safe",
+      "id": "penny_hourly_report",
+      "kwargs": [],
+      "trigger": "cron[hour='10-14', minute='0']"
+    },
+    {
+      "func": "run_penny_regime_compute",
+      "id": "penny_regime_compute",
+      "kwargs": [],
+      "trigger": "cron[hour='9', minute='20']"
+    },
+    {
+      "func": "run_penny_regime_refresh",
+      "id": "penny_regime_refresh",
+      "kwargs": [],
+      "trigger": "cron[hour='13', minute='0']"
+    },
+    {
+      "func": "run_penny_scanner_once",
+      "id": "penny_scan_interval",
+      "kwargs": [],
+      "trigger": "interval[0:01:00]"
+    }
+  ],
+  "routes": [
+    {
+      "endpoint": "get_edge_statistics",
+      "methods": [
+        "GET"
+      ],
+      "path": "/analytics/edge",
+      "response_model": null
+    },
+    {
+      "endpoint": "get_funnel",
+      "methods": [
+        "GET"
+      ],
+      "path": "/analytics/funnel",
+      "response_model": null
+    },
+    {
+      "endpoint": "get_operational_coverage",
+      "methods": [
+        "GET"
+      ],
+      "path": "/analytics/operational-coverage",
+      "response_model": null
+    },
+    {
+      "endpoint": "get_optional_ai_status",
+      "methods": [
+        "GET"
+      ],
+      "path": "/analytics/optional-ai-status",
+      "response_model": null
+    },
+    {
+      "endpoint": "get_outcomes",
+      "methods": [
+        "GET"
+      ],
+      "path": "/analytics/outcomes",
+      "response_model": null
+    },
+    {
+      "endpoint": "get_proactive_activity",
+      "methods": [
+        "GET"
+      ],
+      "path": "/analytics/proactive-activity",
+      "response_model": null
+    },
+    {
+      "endpoint": "get_proactive_comparison",
+      "methods": [
+        "GET"
+      ],
+      "path": "/analytics/proactive-comparison",
+      "response_model": null
+    },
+    {
+      "endpoint": "get_proactive_diagnostics",
+      "methods": [
+        "GET"
+      ],
+      "path": "/analytics/proactive-diagnostics",
+      "response_model": null
+    },
+    {
+      "endpoint": "get_proactive_research_comparison",
+      "methods": [
+        "GET"
+      ],
+      "path": "/analytics/proactive-research-comparison",
+      "response_model": null
+    },
+    {
+      "endpoint": "get_proactive_session_diagnostics",
+      "methods": [
+        "GET"
+      ],
+      "path": "/analytics/proactive-session-diagnostics",
+      "response_model": null
+    },
+    {
+      "endpoint": "get_reconciliation_evidence",
+      "methods": [
+        "GET"
+      ],
+      "path": "/analytics/reconciliation-evidence",
+      "response_model": null
+    },
+    {
+      "endpoint": "get_scheduler_timing",
+      "methods": [
+        "GET"
+      ],
+      "path": "/analytics/scheduler-timing",
+      "response_model": null
+    },
+    {
+      "endpoint": "get_suggestions",
+      "methods": [
+        "GET"
+      ],
+      "path": "/analytics/suggestions",
+      "response_model": null
+    },
+    {
+      "endpoint": "runs",
+      "methods": [
+        "GET"
+      ],
+      "path": "/backtests/runs",
+      "response_model": null
+    },
+    {
+      "endpoint": "create_run",
+      "methods": [
+        "POST"
+      ],
+      "path": "/backtests/runs",
+      "response_model": null
+    },
+    {
+      "endpoint": "run_detail",
+      "methods": [
+        "GET"
+      ],
+      "path": "/backtests/runs/{run_id}",
+      "response_model": null
+    },
+    {
+      "endpoint": "strategies",
+      "methods": [
+        "GET"
+      ],
+      "path": "/backtests/strategies",
+      "response_model": null
+    },
+    {
+      "endpoint": "get_bankroll_route",
+      "methods": [
+        "GET"
+      ],
+      "path": "/bankroll",
+      "response_model": null
+    },
+    {
+      "endpoint": "get_bankroll_breakdown",
+      "methods": [
+        "GET"
+      ],
+      "path": "/bankroll/breakdown",
+      "response_model": null
+    },
+    {
+      "endpoint": "get_bankroll_divisions",
+      "methods": [
+        "GET"
+      ],
+      "path": "/bankroll/divisions",
+      "response_model": null
+    },
+    {
+      "endpoint": "get_circuit_breaker",
+      "methods": [
+        "GET"
+      ],
+      "path": "/circuit-breaker",
+      "response_model": null
+    },
+    {
+      "endpoint": "reset_circuit_breaker",
+      "methods": [
+        "POST"
+      ],
+      "path": "/circuit-breaker/reset",
+      "response_model": null
+    },
+    {
+      "endpoint": "top_level_command_get",
+      "methods": [
+        "GET"
+      ],
+      "path": "/command/{cmd}",
+      "response_model": null
+    },
+    {
+      "endpoint": "top_level_command_post",
+      "methods": [
+        "POST"
+      ],
+      "path": "/command/{cmd}",
+      "response_model": null
+    },
+    {
+      "endpoint": "get_fno_opening_range_experiment",
+      "methods": [
+        "GET"
+      ],
+      "path": "/experiments/fno-opening-range",
+      "response_model": null
+    },
+    {
+      "endpoint": "get_momentum_experiment",
+      "methods": [
+        "GET"
+      ],
+      "path": "/experiments/momentum",
+      "response_model": null
+    },
+    {
+      "endpoint": "get_penny_experiment",
+      "methods": [
+        "GET"
+      ],
+      "path": "/experiments/penny",
+      "response_model": null
+    },
+    {
+      "endpoint": "health_check",
+      "methods": [
+        "GET"
+      ],
+      "path": "/health",
+      "response_model": null
+    },
+    {
+      "endpoint": "get_nse_holidays",
+      "methods": [
+        "GET"
+      ],
+      "path": "/holidays",
+      "response_model": null
+    },
+    {
+      "endpoint": "post_tv_fyers_backtest_run",
+      "methods": [
+        "POST"
+      ],
+      "path": "/internal/tv-fyers/backtest/run",
+      "response_model": null
+    },
+    {
+      "endpoint": "get_tv_fyers_option_chain",
+      "methods": [
+        "GET"
+      ],
+      "path": "/internal/tv-fyers/optionchain",
+      "response_model": null
+    },
+    {
+      "endpoint": "get_tv_fyers_positions_route",
+      "methods": [
+        "GET"
+      ],
+      "path": "/internal/tv-fyers/positions",
+      "response_model": null
+    },
+    {
+      "endpoint": "post_tv_fyers_signal",
+      "methods": [
+        "POST"
+      ],
+      "path": "/internal/tv-fyers/signal",
+      "response_model": null
+    },
+    {
+      "endpoint": "get_tv_fyers_signals",
+      "methods": [
+        "GET"
+      ],
+      "path": "/internal/tv-fyers/signals",
+      "response_model": null
+    },
+    {
+      "endpoint": "get_tv_fyers_status",
+      "methods": [
+        "GET"
+      ],
+      "path": "/internal/tv-fyers/status",
+      "response_model": null
+    },
+    {
+      "endpoint": "post_tv_fyers_token",
+      "methods": [
+        "POST"
+      ],
+      "path": "/internal/tv-fyers/token",
+      "response_model": null
+    },
+    {
+      "endpoint": "post_tv_fyers_token_invalidate",
+      "methods": [
+        "POST"
+      ],
+      "path": "/internal/tv-fyers/token/invalidate",
+      "response_model": null
+    },
+    {
+      "endpoint": "cas_eligibility",
+      "methods": [
+        "GET"
+      ],
+      "path": "/market-session/cas-eligibility",
+      "response_model": null
+    },
+    {
+      "endpoint": "owner_entry_halt",
+      "methods": [
+        "GET"
+      ],
+      "path": "/market-session/owner-entry-halt",
+      "response_model": null
+    },
+    {
+      "endpoint": "get_momentum_signals",
+      "methods": [
+        "GET"
+      ],
+      "path": "/momentum-signals",
+      "response_model": null
+    },
+    {
+      "endpoint": "nifty_command_get",
+      "methods": [
+        "GET"
+      ],
+      "path": "/nifty/command/{cmd}",
+      "response_model": null
+    },
+    {
+      "endpoint": "get_fno_exit_intents",
+      "methods": [
+        "GET"
+      ],
+      "path": "/ops/fno-exit-intents",
+      "response_model": null
+    },
+    {
+      "endpoint": "post_fno_exit_resolution",
+      "methods": [
+        "POST"
+      ],
+      "path": "/ops/fno-exit-intents/{position_id}/resolve",
+      "response_model": null
+    },
+    {
+      "endpoint": "get_ops_metrics",
+      "methods": [
+        "GET"
+      ],
+      "path": "/ops/metrics",
+      "response_model": null
+    },
+    {
+      "endpoint": "post_optional_ai_status",
+      "methods": [
+        "POST"
+      ],
+      "path": "/ops/optional-ai-status",
+      "response_model": null
+    },
+    {
+      "endpoint": "get_partner_advisory_cards",
+      "methods": [
+        "GET"
+      ],
+      "path": "/partner/advisory/cards",
+      "response_model": null
+    },
+    {
+      "endpoint": "post_partner_advisory_feedback",
+      "methods": [
+        "POST"
+      ],
+      "path": "/partner/advisory/cards/{advisory_id}/feedback",
+      "response_model": null
+    },
+    {
+      "endpoint": "get_partner_advisory_diagnostics",
+      "methods": [
+        "GET"
+      ],
+      "path": "/partner/advisory/diagnostics",
+      "response_model": null
+    },
+    {
+      "endpoint": "get_partner_advisory_effective_settings",
+      "methods": [
+        "GET"
+      ],
+      "path": "/partner/advisory/effective-settings",
+      "response_model": null
+    },
+    {
+      "endpoint": "get_partner_advisory_profile",
+      "methods": [
+        "GET"
+      ],
+      "path": "/partner/advisory/profile",
+      "response_model": null
+    },
+    {
+      "endpoint": "put_partner_advisory_profile",
+      "methods": [
+        "PUT"
+      ],
+      "path": "/partner/advisory/profile",
+      "response_model": null
+    },
+    {
+      "endpoint": "put_partner_advisory_qualification",
+      "methods": [
+        "POST"
+      ],
+      "path": "/partner/advisory/qualifications",
+      "response_model": null
+    },
+    {
+      "endpoint": "post_partner_advisory_research_artifact",
+      "methods": [
+        "POST"
+      ],
+      "path": "/partner/advisory/research-artifacts",
+      "response_model": null
+    },
+    {
+      "endpoint": "get_partner_advisory_research_readiness",
+      "methods": [
+        "GET"
+      ],
+      "path": "/partner/advisory/research-readiness",
+      "response_model": null
+    },
+    {
+      "endpoint": "get_partner_advisory_setup",
+      "methods": [
+        "GET"
+      ],
+      "path": "/partner/advisory/setup",
+      "response_model": null
+    },
+    {
+      "endpoint": "post_partner_advisory_telegram_diagnostic",
+      "methods": [
+        "POST"
+      ],
+      "path": "/partner/advisory/telegram-diagnostic",
+      "response_model": null
+    },
+    {
+      "endpoint": "get_partner_hedge_cards",
+      "methods": [
+        "GET"
+      ],
+      "path": "/partner/hedge/cards",
+      "response_model": null
+    },
+    {
+      "endpoint": "get_partner_hedge_delivery_backlog",
+      "methods": [
+        "GET"
+      ],
+      "path": "/partner/hedge/delivery-backlog",
+      "response_model": null
+    },
+    {
+      "endpoint": "resolve_partner_hedge_delivery_backlog",
+      "methods": [
+        "POST"
+      ],
+      "path": "/partner/hedge/delivery-backlog/{kind}/{dedup_key}/resolve",
+      "response_model": null
+    },
+    {
+      "endpoint": "get_partner_hedge_positions",
+      "methods": [
+        "GET"
+      ],
+      "path": "/partner/hedge/positions",
+      "response_model": null
+    },
+    {
+      "endpoint": "add_partner_hedge_position",
+      "methods": [
+        "POST"
+      ],
+      "path": "/partner/hedge/positions",
+      "response_model": null
+    },
+    {
+      "endpoint": "close_partner_hedge_position",
+      "methods": [
+        "POST"
+      ],
+      "path": "/partner/hedge/positions/{position_id}/close",
+      "response_model": null
+    },
+    {
+      "endpoint": "reconcile_partner_hedge_position",
+      "methods": [
+        "POST"
+      ],
+      "path": "/partner/hedge/positions/{position_id}/reconcile",
+      "response_model": null
+    },
+    {
+      "endpoint": "get_partner_hedge_readiness",
+      "methods": [
+        "GET"
+      ],
+      "path": "/partner/hedge/readiness",
+      "response_model": null
+    },
+    {
+      "endpoint": "add_partner_hedge_gate_evidence",
+      "methods": [
+        "POST"
+      ],
+      "path": "/partner/hedge/readiness/evidence",
+      "response_model": null
+    },
+    {
+      "endpoint": "get_partner_hedge_status",
+      "methods": [
+        "GET"
+      ],
+      "path": "/partner/hedge/status",
+      "response_model": null
+    },
+    {
+      "endpoint": "add_partner_vix_observation",
+      "methods": [
+        "POST"
+      ],
+      "path": "/partner/hedge/vix",
+      "response_model": null
+    },
+    {
+      "endpoint": "penny_command_get",
+      "methods": [
+        "GET"
+      ],
+      "path": "/penny/command/{cmd}",
+      "response_model": null
+    },
+    {
+      "endpoint": "penny_command_post",
+      "methods": [
+        "POST"
+      ],
+      "path": "/penny/command/{cmd}",
+      "response_model": null
+    },
+    {
+      "endpoint": "get_performance",
+      "methods": [
+        "GET"
+      ],
+      "path": "/performance",
+      "response_model": "PerformanceReport"
+    },
+    {
+      "endpoint": "get_division_performance",
+      "methods": [
+        "GET"
+      ],
+      "path": "/performance/divisions",
+      "response_model": null
+    },
+    {
+      "endpoint": "get_positions_route",
+      "methods": [
+        "GET"
+      ],
+      "path": "/positions",
+      "response_model": "list"
+    },
+    {
+      "endpoint": "close_position",
+      "methods": [
+        "POST"
+      ],
+      "path": "/positions/close",
+      "response_model": null
+    },
+    {
+      "endpoint": "add_manual_position",
+      "methods": [
+        "POST"
+      ],
+      "path": "/positions/manual",
+      "response_model": null
+    },
+    {
+      "endpoint": "get_reconciliation_discrepancies",
+      "methods": [
+        "GET"
+      ],
+      "path": "/reconciliation/discrepancies",
+      "response_model": null
+    },
+    {
+      "endpoint": "post_reconciliation_import_statement",
+      "methods": [
+        "POST"
+      ],
+      "path": "/reconciliation/import-statement",
+      "response_model": null
+    },
+    {
+      "endpoint": "get_rejected_signals",
+      "methods": [
+        "GET"
+      ],
+      "path": "/rejected",
+      "response_model": null
+    },
+    {
+      "endpoint": "promotion_readiness_report",
+      "methods": [
+        "GET"
+      ],
+      "path": "/research/promotion-readiness",
+      "response_model": null
+    },
+    {
+      "endpoint": "get_signals",
+      "methods": [
+        "GET"
+      ],
+      "path": "/signals",
+      "response_model": "PortfolioResponse"
+    },
+    {
+      "endpoint": "get_strategy_funnel",
+      "methods": [
+        "GET"
+      ],
+      "path": "/strategy/funnel",
+      "response_model": null
+    },
+    {
+      "endpoint": "get_strategy_promotion",
+      "methods": [
+        "GET"
+      ],
+      "path": "/strategy/promotion",
+      "response_model": null
+    },
+    {
+      "endpoint": "test_momentum_screener",
+      "methods": [
+        "POST"
+      ],
+      "path": "/test-momentum",
+      "response_model": null
+    },
+    {
+      "endpoint": "inject_token",
+      "methods": [
+        "POST"
+      ],
+      "path": "/token",
+      "response_model": null
+    },
+    {
+      "endpoint": "get_current_token",
+      "methods": [
+        "GET"
+      ],
+      "path": "/token/current",
+      "response_model": null
+    },
+    {
+      "endpoint": "invalidate_token",
+      "methods": [
+        "POST"
+      ],
+      "path": "/token/invalidate",
+      "response_model": null
+    }
+  ]
+}

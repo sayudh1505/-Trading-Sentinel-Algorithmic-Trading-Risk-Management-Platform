@@ -1,0 +1,525 @@
+"""[ROADMAP-4.1 stage 3, 2026-07-13] Telegram command dispatch and analytics endpoints.
+
+Extracted verbatim from main.py. Registered on the app via
+`app.include_router(router)`, so the route table -- paths, methods, endpoint
+names, response models -- is byte-identical; the 24-route characterization
+golden proves it.
+
+EVERY business name is reached through `_main` at CALL time, not imported.
+That is not stylistic. Two independent reasons, both load-bearing:
+
+  1. Eight of main's globals are REBOUND at runtime via `global` statements
+     (current_signals, market_regime, momentum_signals_today, last_run,
+     rejected_signals, current_momentum_signals, last_momentum_date,
+     _last_regime_state). `from main import current_signals` would capture the
+     list that existed at import and serve it forever, while run_screener
+     quietly rebinds main's name to a NEW list on every scan. The endpoint
+     would go permanently stale and nothing would raise.
+
+  2. The suite patches ~25 of these names BY NAME on main (kite,
+     get_open_positions, record_trade_close, post_login_initialization,
+     run_momentum_screener, ...). Import-time binding silently detaches every
+     one of those patches.
+
+The module-level `import main as _main` is safe despite main importing this
+module: Python registers main in sys.modules BEFORE executing it, so we bind
+the module object, and only ever touch its attributes at request time -- by
+which point main is fully initialised.
+"""
+from fastapi import APIRouter, HTTPException, Request
+
+import main as _main
+
+from config import settings
+
+router = APIRouter()
+
+
+
+
+# [TIER3-INTERACTIVE-COMMANDS 2026-06-25] Telegram command endpoint.
+# The node-gateway forwards /penny <subcommand> <args> messages to
+# python-engine via these endpoints, then echoes the reply back to
+# the user's Telegram chat. Read-only commands (stats, regime, help,
+# skips) use GET. Mutating commands (skip, unskip) use POST.
+@router.get("/penny/command/{cmd}")
+async def penny_command_get(cmd: str):
+    """GET handler for read-only commands. Returns plain text reply."""
+    from penny_commands import dispatch
+    return {"reply": dispatch(cmd, "", settings.DB_PATH)}
+
+
+
+
+@router.post("/penny/command/{cmd}")
+async def penny_command_post(cmd: str, payload: dict):
+    """POST handler for mutating commands. Body: {"args": "<ticker>"}."""
+    from penny_commands import dispatch
+    args = (payload or {}).get("args", "")
+    return {"reply": dispatch(cmd, args, settings.DB_PATH)}
+
+
+
+
+# [TIER3-NIFTY-COMMANDS 2026-06-25] Read-only Nifty commands.
+# Per operator mandate, these NEVER mutate state -- they're pure
+# queries against _main.current_signals, _main.current_momentum_signals, and
+# _main.market_regime globals + DB-backed bankroll/circuit-breaker reads.
+# To act on Nifty signals use the inline callback buttons or the
+# HTTP API (POST /positions/close, etc.).
+@router.get("/nifty/command/{cmd}")
+async def nifty_command_get(cmd: str):
+    """GET handler for read-only Nifty commands."""
+    from nifty_commands import dispatch
+    return {"reply": dispatch(cmd, "", settings.DB_PATH)}
+
+
+
+
+# No POST handler: by design, /nifty commands don't mutate state.
+
+
+# [TIER3-CROSS-SUBSYSTEM-COMMANDS 2026-06-25] Phase B.
+# Top-level /health and /regime (no /penny prefix). Same read-only
+# posture as /nifty. The dispatcher routes by command name.
+@router.get("/command/{cmd}")
+async def top_level_command_get(cmd: str):
+    """Top-level read-only commands: /health, /regime.
+
+    These are cross-subsystem views (penny + nifty side by side)
+    and don't fit under /penny or /nifty specifically. The gateway
+    routes /health and /regime (no prefix) here.
+    """
+    # [DIVISION-BREAKDOWN 2026-07-15] /divisions and /bankroll render the full
+    # per-division P&L attribution. Handled here (not via the sync penny
+    # dispatch) because division_breakdown is async.
+    if cmd.lower() in ("divisions", "bankroll"):
+        from performance import division_breakdown, format_division_breakdown
+        data = await division_breakdown(settings.DB_PATH)
+        return {"reply": format_division_breakdown(data)}
+
+    # [STRATEGY-FUNNEL 2026-07-20] /funnel -> per-strategy activity + P&L
+    # heartbeat (evals, accepts, top reject reasons, live-vs-paper P&L).
+    if cmd.lower() in ("funnel", "strategies"):
+        from analytics import strategy_funnel, format_strategy_funnel
+        data = await strategy_funnel(settings.DB_PATH)
+        return {"reply": format_strategy_funnel(data)}
+
+    # [STRATEGY-PROMOTION 2026-07-20] /promotion -> paper->live readiness bar.
+    if cmd.lower() in ("promotion", "promote", "ladder"):
+        from analytics import promotion_report, format_promotion_report
+        data = await promotion_report(settings.DB_PATH)
+        return {"reply": format_promotion_report(data)}
+
+    # [HALT 2026-08-05] Read-only view of the kill switch. Tripping and
+    # clearing are POST (see top_level_command_post) -- a GET that can stop
+    # trading is one link-preview away from an accident.
+    if cmd.lower() in ("halt", "resume", "haltstatus"):
+        import halt_switch
+        return {"reply": _halt_status_text(halt_switch)}
+
+    from penny_commands import dispatch as _penny_dispatch
+    # penny_commands.dispatch is the universal entry point -- it
+    # routes /health and /regime to the cross-subsystem handlers.
+    return {"reply": _penny_dispatch(cmd, "", settings.DB_PATH)}
+
+
+def _halt_status_text(halt_switch) -> str:
+    """Global + per-channel kill-switch state, with the commands to change it."""
+    lines = ["KILL SWITCH", "", f"  global   {halt_switch.describe(None)}"]
+    for channel in ("momentum", "penny", "fno"):
+        # channel_state ignores the global sentinel on purpose: during a global
+        # halt every channel would otherwise echo the global line, hiding what
+        # a global clear would leave behind.
+        own, attribution = halt_switch.channel_state(channel)
+        lines.append(f"  {channel:<8} {'HALTED' if own else 'armed'}")
+        if own and attribution:
+            lines.append(f"           {attribution.get('reason', '')}")
+    lines += [
+        "",
+        "Entries are blocked while halted. Exits (stops, unwinds,",
+        "square-off) are NEVER blocked.",
+        "",
+        "  /halt <reason>              trip globally",
+        "  /halt <channel> <reason>    trip one channel",
+        "  /resume global              clear the global halt",
+        "  /resume <channel>           clear one channel",
+        "",
+        "A bare /halt or /resume only shows this view -- both mutations",
+        "need an explicit argument.",
+    ]
+    return "\n".join(lines)
+
+
+@router.post("/command/{cmd}")
+async def top_level_command_post(cmd: str, request: Request):
+    """[HALT 2026-08-05] Mutating top-level commands: /halt and /resume.
+
+    POST, not GET, because these change whether the system can trade.
+    """
+    import halt_switch
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    args = str((body or {}).get("args", "") or "").strip()
+
+    name = cmd.lower()
+    if name not in ("halt", "resume"):
+        raise HTTPException(status_code=404, detail=f"unknown mutating command: {cmd}")
+
+    known_channels = ("momentum", "penny", "fno")
+    first, _, rest = args.partition(" ")
+    channel = first.lower() if first.lower() in known_channels else None
+    remainder = (rest if channel else args).strip()
+
+    if name == "resume":
+        # Strict, unlike /halt. `/resume momentom` (typo) must NOT fall through
+        # to clearing the GLOBAL halt -- that is the one mistake here that
+        # silently re-arms more than the operator asked for. Only the literal
+        # word "global" or a known channel may clear anything.
+        target = args.strip().lower()
+        if target not in ("global",) + known_channels:
+            return {"reply": (
+                f"Unknown resume target {args!r}.\n"
+                f"Use: /resume global | " + " | ".join(f"/resume {c}" for c in known_channels)
+            )}
+        channel = None if target == "global" else target
+
+    if name == "halt":
+        reason = remainder or "tripped from Telegram with no reason given"
+        try:
+            payload = halt_switch.trip(reason, by="operator", channel=channel)
+        except OSError as exc:
+            # A kill switch that cannot write is not a kill switch. Say so.
+            return {"reply": f"FAILED to trip halt: {exc}\nTrading is STILL LIVE."}
+        scope = payload.get("scope", "global")
+        return {"reply": (
+            f"HALTED ({scope}).\nreason: {payload.get('reason')}\n"
+            f"at: {payload.get('tripped_at')}\n\n"
+            "New entries are blocked. Exits still work.\n"
+            # Always name the target: bare /resume is the read-only status
+            # view, so "Clear with /resume" would be an instruction that does
+            # nothing and reads as a failure to the operator.
+            f"Clear with /resume {scope}."
+        )}
+
+    removed = halt_switch.clear(channel)
+    scope = channel or "global"
+    if not removed:
+        return {"reply": f"No {scope} halt was set. Nothing to clear."}
+    still, attribution = halt_switch.halt_state(channel)
+    tail = ""
+    if still:
+        tail = (f"\n\nNOTE: still halted -- {(attribution or {}).get('scope')} "
+                f"sentinel is present. Clear that too.")
+    return {"reply": f"Cleared the {scope} halt. Entries re-enabled.{tail}"}
+
+
+
+# [ANALYTICS 2026-06-16] Self-improvement endpoints.
+# GET /analytics/funnel?days=7     -> gate rejection counts (JSON)
+# GET /analytics/suggestions?days=14 -> actionable suggestions (JSON)
+# GET /analytics/outcomes?days=14  -> outcome correlator (JSON)
+# CLI: `python -m analytics --days 14`  for a human terminal report.
+@router.get("/analytics/funnel")
+async def get_funnel(days: int = 7):
+    from analytics import gate_funnel_report
+    return await gate_funnel_report(settings.DB_PATH, days=days)
+
+
+@router.get("/strategy/funnel")
+async def get_strategy_funnel(date: str = None):
+    """[STRATEGY-FUNNEL 2026-07-20] Unified per-strategy activity + P&L for
+    one day (default today, IST). date=YYYY-MM-DD to backfill."""
+    from analytics import strategy_funnel
+    return await strategy_funnel(settings.DB_PATH, day_iso=date)
+
+
+@router.get("/strategy/promotion")
+async def get_strategy_promotion():
+    """[STRATEGY-PROMOTION 2026-07-20] Paper->live promotion ladder: per
+    strategy, whether it has earned live capital (trades, net-cost expectancy,
+    drawdown budget)."""
+    from analytics import promotion_report
+    return await promotion_report(settings.DB_PATH)
+
+
+
+@router.get("/analytics/outcomes")
+async def get_outcomes(days: int = 14):
+    from analytics import outcome_correlator
+    return await outcome_correlator(settings.DB_PATH, days=days)
+
+
+@router.get("/analytics/proactive-activity")
+async def get_proactive_activity(days: int = 7):
+    """Mode-separated proactive evidence; never a trading control surface."""
+    from proactive_intelligence import proactive_activity_report
+    report = await proactive_activity_report(settings.DB_PATH, days=days)
+    from broker_reconciliation import broker_statement_report
+    account_id = str(settings.BROKER_RECONCILIATION_ACCOUNT_ID).strip()
+    report["broker_statement"] = (
+        await broker_statement_report(settings.DB_PATH, account_id=account_id)
+        if account_id else {"status": "UNAVAILABLE", "reason": "ACCOUNT_NOT_CONFIGURED", "can_place_orders": False}
+    )
+    return report
+
+
+@router.get("/analytics/proactive-comparison")
+async def get_proactive_comparison(days: int = 90):
+    """Costed shadow-outcome research; never an execution control surface."""
+    from proactive_intelligence import proactive_shadow_comparison
+    return await proactive_shadow_comparison(settings.DB_PATH, days=days)
+
+
+@router.get("/analytics/proactive-research-comparison")
+async def get_proactive_research_comparison(research_run_id: str | None = None):
+    """Frozen matched SHADOW trials; no route here can change execution."""
+    from proactive_intelligence import proactive_shadow_research_report
+    return await proactive_shadow_research_report(settings.DB_PATH, research_run_id=research_run_id)
+
+
+@router.get("/analytics/proactive-diagnostics")
+async def get_proactive_diagnostics():
+    from datetime import datetime, timezone
+    from proactive_diagnostics import proactive_owner_diagnostics
+    return await proactive_owner_diagnostics(settings.DB_PATH, now=datetime.now(timezone.utc))
+
+
+@router.get("/analytics/proactive-session-diagnostics")
+async def get_proactive_session_diagnostics(sessions: int = 5):
+    """Calendar-aware two/five-session evidence; never an execution route."""
+    from datetime import datetime, timezone
+    from proactive_intelligence import proactive_session_diagnostics
+    try:
+        return await proactive_session_diagnostics(
+            settings.DB_PATH, now=datetime.now(timezone.utc), session_count=sessions,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.get("/analytics/scheduler-timing")
+async def get_scheduler_timing(limit: int = 500):
+    """Observed scheduler timing/rejection evidence; never a control surface."""
+    from scheduler_telemetry import scheduler_timing_report
+    try:
+        return await scheduler_timing_report(settings.DB_PATH, limit=limit)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.get("/analytics/operational-coverage")
+async def get_operational_coverage():
+    """Producer-level readiness; unavailable evidence is never converted to zero."""
+    from operational_coverage import operational_coverage_report
+    return await operational_coverage_report(settings.DB_PATH)
+
+
+@router.get("/analytics/reconciliation-evidence")
+async def get_reconciliation_evidence(source: str | None = None, limit: int = 200):
+    """Stable-link reconciliation sheets; intentionally read-only."""
+    from reconciliation_evidence import reconciliation_evidence_report
+    try:
+        return await reconciliation_evidence_report(settings.DB_PATH, source=source, limit=limit)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+
+@router.get("/analytics/suggestions")
+async def get_suggestions(days: int = 14):
+    from analytics import strategy_suggestions
+    return await strategy_suggestions(settings.DB_PATH, days=days)
+
+
+# [ROADMAP-5.1 2026-07-13] The numbers that can actually say whether there is an
+# edge: expectancy (R and rupees), profit factor, max drawdown, each with a
+# bootstrapped 95% CI.
+#
+# 90-day default window, not the 7/14 used above: these statistics need a
+# sample, and a fortnight of this system's trade frequency cannot supply one.
+# The response carries `n`, `reliable` and a conservative `verdict` -- an edge
+# is only claimed when the CI on expectancy sits ENTIRELY above zero, so a
+# flattering point estimate on eight trades reads as "not_demonstrated" rather
+# than as a green light.
+@router.get("/analytics/edge")
+async def get_edge_statistics(days: int = 90, strategy: str | None = None):
+    from analytics import edge_statistics
+    return await edge_statistics(settings.DB_PATH, days=days, strategy=strategy)
+
+
+# [WORKFLOW-F F5 2026-09-13] Broker statement automation route. This is the
+# programmatic ingestion surface for an admin UI: the operator POSTs a
+# JSON payload matching ``broker_reconciliation.import_broker_statement``'s
+# kwargs, and the route returns the imported flag, broker statement
+# status, the fail-closed broker/internal reference report, and discrepancy IDs
+# recorded by the F4/F.10A framework as a side effect. There is no scheduler;
+# the route is a thin wrapper around the same async function the F5 CLI calls.
+#
+# Idempotent: the existing ``import_broker_statement`` rejects
+# conflicting payloads at the SHA-256 boundary, and the F4 framework
+# is idempotent on ``(category, evidence_key)``. A retried POST with
+# the same payload produces the same response (modulo the boolean
+# ``imported`` field, which flips to False on the second call).
+#
+# No broker network calls. No ledger mutation. No scheduler.
+@router.post("/reconciliation/import-statement")
+async def post_reconciliation_import_statement(payload: dict):
+    """Ingest a broker statement payload; record discrepancies as a side effect."""
+    from broker_reconciliation import (
+        broker_statement_report,
+        import_broker_statement,
+    )
+    from discrepancies import record_current_state
+    from datetime import datetime as _dt, timezone as _tz
+
+    if not isinstance(payload, dict):
+        raise HTTPException(
+            status_code=422, detail="payload must be a JSON object",
+        )
+    required = (
+        "account_id", "statement_id", "as_of",
+        "opening_cash", "closing_cash", "entries", "fills",
+    )
+    missing = [k for k in required if k not in payload]
+    if missing:
+        raise HTTPException(
+            status_code=422,
+            detail=f"payload missing required keys: {', '.join(missing)}",
+        )
+    try:
+        as_of = _dt.fromisoformat(str(payload["as_of"]).replace("Z", "+00:00"))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=f"as_of: {exc}") from exc
+    if as_of.tzinfo is None or as_of.tzinfo.utcoffset(as_of) is None:
+        raise HTTPException(
+            status_code=422, detail="as_of must be timezone-aware",
+        )
+    if not isinstance(payload["entries"], list):
+        raise HTTPException(status_code=422, detail="entries must be a list")
+    if not isinstance(payload["fills"], list):
+        raise HTTPException(status_code=422, detail="fills must be a list")
+    account_id = payload["account_id"]
+    statement_id = payload["statement_id"]
+    if not isinstance(account_id, str) or not account_id.strip():
+        raise HTTPException(status_code=422, detail="account_id must be a non-empty string")
+    if not isinstance(statement_id, str) or not statement_id.strip():
+        raise HTTPException(status_code=422, detail="statement_id must be a non-empty string")
+    account_id, statement_id = account_id.strip(), statement_id.strip()
+    try:
+        imported = await import_broker_statement(
+            settings.DB_PATH,
+            account_id=account_id,
+            statement_id=statement_id,
+            as_of=as_of,
+            opening_cash=float(payload["opening_cash"]),
+            closing_cash=float(payload["closing_cash"]),
+            entries=payload["entries"],
+            fills=payload["fills"],
+        )
+    except ValueError as exc:
+        # Validation error from import_broker_statement (e.g. conflicting
+        # SHA-256, unsupported entry_type, non-finite numbers).
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except sqlite3.Error as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    report = await broker_statement_report(
+        settings.DB_PATH, account_id=account_id,
+    )
+    from broker_internal_reconciliation import broker_internal_reference_report
+    broker_internal = await broker_internal_reference_report(
+        settings.DB_PATH,
+        account_id=account_id,
+        configured_account_id=settings.BROKER_RECONCILIATION_ACCOUNT_ID,
+        statement_id=statement_id,
+    )
+    rec = await record_current_state(
+        settings.DB_PATH, account_id=account_id, actor="http",
+        broker_report=report, broker_internal_report=broker_internal,
+    )
+    return {
+        "imported": bool(imported),
+        "broker_status": report.get("status", "UNAVAILABLE"),
+        "discrepancy_ids": {
+            "broker": list(rec.get("broker", [])),
+            "evidence": list(rec.get("evidence", [])),
+            "broker_internal": list(rec.get("broker_internal", [])),
+        },
+        "broker_internal": broker_internal,
+        "can_place_orders": False,  # never an order authority
+    }
+
+
+# [WORKFLOW-F F5 2026-09-13] Read-side route for recorded discrepancies.
+# Read-only; mirrors ``GET /analytics/reconciliation-evidence`` style.
+# No auth (matches the existing pattern).
+@router.get("/reconciliation/discrepancies")
+async def get_reconciliation_discrepancies(
+    account: str | None = None,
+    source: str | None = None,
+    category: str | None = None,
+    status: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    limit: int = 200,
+):
+    from datetime import datetime as _dt
+    from discrepancies import (
+        DiscrepancyCategory, DiscrepancyStatus, list_discrepancies,
+    )
+    cat = None
+    if category is not None:
+        try:
+            cat = DiscrepancyCategory(category)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=f"category must be a DiscrepancyCategory value, got {category!r}",
+            ) from exc
+    sts = None
+    if status is not None:
+        try:
+            sts = DiscrepancyStatus(status)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=f"status must be a DiscrepancyStatus value, got {status!r}",
+            ) from exc
+    since_dt = None
+    if since is not None:
+        try:
+            since_dt = _dt.fromisoformat(since.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=f"since: {exc}") from exc
+        if since_dt.tzinfo is None or since_dt.tzinfo.utcoffset(since_dt) is None:
+            raise HTTPException(status_code=422, detail="since must be timezone-aware")
+    until_dt = None
+    if until is not None:
+        try:
+            until_dt = _dt.fromisoformat(until.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=f"until: {exc}") from exc
+        if until_dt.tzinfo is None or until_dt.tzinfo.utcoffset(until_dt) is None:
+            raise HTTPException(status_code=422, detail="until must be timezone-aware")
+    try:
+        rows = await list_discrepancies(
+            settings.DB_PATH,
+            account_id=account, source=source,
+            category=cat, status=sts,
+            since=since_dt, until=until_dt,
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {
+        "rows": [r.to_dict() for r in rows],
+        "filters": {
+            "account": account, "source": source,
+            "category": category, "status": status,
+            "since": since, "until": until, "limit": limit,
+        },
+        "can_place_orders": False,
+    }

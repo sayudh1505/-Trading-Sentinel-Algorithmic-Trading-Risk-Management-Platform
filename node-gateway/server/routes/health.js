@@ -1,0 +1,123 @@
+const express = require('express');
+const router = express.Router();
+const config = require('../config');
+const tokenStore = require('../services/token-store');
+const { isMarketOpen, sessionPhase, currentSessionPhase } = require('../utils/market-hours');
+const { signalsDb } = require('../db/index');
+const { undeliveredAlertCount } = require('../services/telegram');
+const { releaseIdentity } = require('../release-identity');
+
+router.get('/', async (req, res) => {
+  const uptime = Math.floor(process.uptime());
+  const tokenInfo = tokenStore.getStatus();
+  const marketOpen = isMarketOpen();
+  
+  let pythonEngineStatus = 'unreachable';
+  let pythonEngineMs = 0;
+  let pythonEngineRelease = null;
+  
+  // Probe Container B
+  const startMs = Date.now();
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 3000); // Strict 3s timeout
+    const bRes = await fetch(`${config.PYTHON_ENGINE_URL}/health`, { signal: controller.signal });
+    clearTimeout(timeout);
+    if (bRes.ok) {
+      pythonEngineStatus = 'reachable';
+      pythonEngineMs = Date.now() - startMs;
+      // Release identity is diagnostic only: an unreadable response must not
+      // make the gateway health endpoint fail or conceal a connectivity fact.
+      try {
+        const engineBody = await bRes.json();
+        if (engineBody && typeof engineBody.release === 'object') {
+          pythonEngineRelease = engineBody.release;
+        }
+      } catch (err) {
+        // Leave it null; the deploy verifier will reject missing identity.
+      }
+    }
+  } catch (e) {
+    // Fails silently, variables remain 'unreachable'
+  }
+
+  // Calculate token age
+  let tokenAgeMin = null;
+  if (tokenInfo.generatedAt) {
+    tokenAgeMin = Math.floor((Date.now() - new Date(tokenInfo.generatedAt).getTime()) / 60000);
+  }
+
+  // DB Metrics
+  let pendingSignals = 0;
+  let unsyncedOrders = 0;
+  let lastSignalReceived = null;
+  let lastOrderPlaced = null;
+  let lastOrderTicker = null;
+
+  try {
+    pendingSignals = signalsDb.prepare(`SELECT count(*) as c FROM received_signals WHERE status = 'PENDING'`).get().c;
+    unsyncedOrders = signalsDb.prepare(`SELECT count(*) as c FROM executed_orders WHERE sync_to_b = 0`).get().c;
+    
+    const lastSig = signalsDb.prepare(`SELECT received_at FROM received_signals ORDER BY received_at DESC LIMIT 1`).get();
+    if (lastSig) lastSignalReceived = lastSig.received_at;
+
+    const lastOrd = signalsDb.prepare(`SELECT placed_at, ticker FROM executed_orders ORDER BY placed_at DESC LIMIT 1`).get();
+    if (lastOrd) {
+      lastOrderPlaced = lastOrd.placed_at;
+      lastOrderTicker = lastOrd.ticker;
+    }
+  } catch (err) {
+    // Handle DB query failure gracefully
+  }
+
+  // [ALERT-DEADLETTER 2026-07-31] Alerts that exhausted every retry. On
+  // 2026-07-28 a momentum EXEC alert died after 3 retries and the only trace
+  // was one log line. Telegram is the broken channel when this happens, so the
+  // backlog is surfaced here instead -- a non-zero count means the operator has
+  // been told something they never received.
+  let undeliveredAlerts = 0;
+  try {
+    undeliveredAlerts = undeliveredAlertCount();
+  } catch (err) {
+    // Never let a health probe fail on a bookkeeping read.
+  }
+
+  // Determine overall status
+  let overallStatus = 'ok';
+  if (tokenInfo.status === 'expired' && marketOpen) {
+    overallStatus = 'critical';
+  } else if (pythonEngineStatus === 'unreachable' || unsyncedOrders > 0
+             || undeliveredAlerts > 0) {
+    overallStatus = 'degraded';
+  }
+
+  res.json({
+    status: overallStatus,
+    uptime_seconds: uptime,
+    token_status: tokenInfo.status,
+    token_age_minutes: tokenAgeMin,
+    telegram_status: "connected", // Simplified, as the bot instance doesn't easily expose health
+    telegram_mode: config.TELEGRAM_MODE,
+    python_engine: pythonEngineStatus,
+    python_engine_ms: pythonEngineMs,
+    market_open: marketOpen,
+    // [WORKFLOW-J.6] Bounded session phase (mirror of
+    // ``python-engine/market_calendar.classify_session_phase``).
+    // Operators can use this to surface CAS sub-windows in
+    // dashboards and to gate CAS-aware decisions in services.
+    // The reading is fresh on every request (no caching) so the
+    // phase is always current as of the response moment.
+    session_phase: currentSessionPhase(),
+    last_signal_received: lastSignalReceived,
+    last_order_placed: lastOrderPlaced,
+    last_order_ticker: lastOrderTicker,
+    pending_signals: pendingSignals,
+    unsynced_orders: unsyncedOrders,
+    undelivered_alerts: undeliveredAlerts,
+    release: releaseIdentity('node-gateway'),
+    python_engine_release: pythonEngineRelease,
+    timestamp: new Date().toISOString()
+  });
+});
+
+module.exports = router;

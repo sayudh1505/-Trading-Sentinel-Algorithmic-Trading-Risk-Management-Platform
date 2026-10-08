@@ -1,0 +1,1385 @@
+"""
+[PENNY-SCANNER 2026-06-21] Orchestrator for the penny subsystem.
+
+Spec §9. Ties together:
+  - PennyUniverse (eligibility + ranking)
+  - PennyRegimeEngine (regime gate)
+  - PennyRiskEngine (sizing + kill-switch + caps + circuit)
+  - penny_engine_connors + penny_engine_breakout (signal generators)
+  - penny_signal_log (CSV + SQLite persistence)
+  - kite (quote + historical fetch + place_order in live mode)
+
+Two modes:
+  - Paper (PENNY_LIVE_TRADING=False, default): signals fire, logged, but
+    NO real orders via kite.place_order()
+  - Live (PENNY_LIVE_TRADING=True): real orders + SL-M
+
+Cadence (spec §9.1):
+  - 30-second polling: run_penny_scanner_once() (MIS Breakout leg)
+  - Once daily 09:30 IST: run_penny_connors_scan() (CNC leg)
+  - 14:30 IST: smart-EOD check on open MIS positions
+
+Hard architectural rule (enforced by tests/test_penny_isolation.py):
+  this module MUST NOT import from engine, regime, risk_engine, portfolio,
+  evaluate_signal, or evaluate_momentum_signal.
+"""
+import asyncio
+import json
+import logging
+import os
+from datetime import datetime, timezone
+from typing import Callable, Optional, List
+from uuid import uuid4
+
+from penny_universe import PennyUniverse
+from penny_models import PennyRegime, PennyLeg
+from penny_risk import PennyRiskEngine
+from penny_executor import PennyExecutor
+from penny_shadow import evaluate_penny_shadows, persist_penny_shadow_results
+from penny_execution_journal import (
+    append_execution_event, attempt_event_payload, attempt_event_types,
+    attempt_identity,
+)
+from penny_position_reservations import (
+    persist_reserved_penny_position, reserve_penny_position,
+    set_penny_reservation_state,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def _scan_summary(scan_id, *, accept=0, reject=0, error=0, order_attempt=0,
+                  fill=0, protected=0, position=0, failure=0):
+    return {
+        "scan_id": scan_id, "accept": accept, "reject": reject, "error": error,
+        "evaluator_accept": accept, "order_attempt": order_attempt, "fill": fill,
+        "protected": protected, "position": position, "failure": failure,
+    }
+
+
+def _event_block_safe(ticker, on_date):
+    """[ROADMAP-3.10 2026-07-12] Wrapper so an event_calendar import or
+    runtime failure can never crash a scan tick -- fails to ALLOW."""
+    try:
+        from event_calendar import event_block
+        return event_block(ticker, on_date)
+    except Exception as e:
+        logger.warning("penny_event_check_failed ticker=%s error=%s", ticker, str(e))
+        return False, ""
+
+
+class PennyScanner:
+    def __init__(
+        self,
+        kite,
+        universe_json_path: str,
+        paper_mode: bool = True,
+        regime=None,  # str (legacy, frozen) or Callable[[], str]
+        daily_pnl_override: Optional[float] = None,
+        ledger_writer=None,
+        source_tag: Optional[str] = None,
+    ):
+        self.kite = kite
+        self.universe_json_path = universe_json_path
+        self.paper_mode = paper_mode
+        self.source_tag = source_tag or ("PENNY_PAPER" if paper_mode else "PENNY")
+        if self.source_tag not in ("PENNY", "PENNY_PAPER"):
+            raise ValueError("classic Penny source_tag must be PENNY or PENNY_PAPER")
+        # [PENNY-STARTUP-GATE 2026-07-02] Default threshold for the
+        # startup-gate to consider the instrument_cache "populated".
+        # NSE_EQ has ~2,000 instruments; 100 is a safe lower-bound
+        # that catches the empty-cache race condition without
+        # blocking when only a handful of tickers are eligible.
+        # Tests can override per-instance.
+        self.instrument_cache_min_count = 100
+        # [AUDIT-FIX-1.3 2026-06-25] Regime used to be a frozen string
+        # captured at construction. That meant a mid-day regime
+        # transition (PR1->PR2->PR3) was invisible to the MIS scanner
+        # until the singleton was rebuilt. The CNC scan rebuilds the
+        # singleton (run_penny_connors_scan sets _penny_scanner=None),
+        # but the 30s MIS loop doesn't -- so PR3_HOT (block all entries)
+        # could miss a transition by hours.
+        #
+        # Now `regime` can be:
+        #   - a string (legacy behaviour: frozen)
+        #   - a callable returning the current regime (live behaviour:
+        #     re-reads the regime engine every access)
+        #   - None (default to PR1_CALM callable)
+        # The property getter below normalises all three.
+        self._regime_getter = self._normalise_regime_getter(regime)
+        self.daily_pnl_override = daily_pnl_override
+        # Risk engine owns sizing + kill-switch (lazy init to read bankroll)
+        from config import settings
+        from penny_risk import PennyRiskEngine
+        bankroll = settings.PENNY_PAPER_BANKROLL if paper_mode else settings.PENNY_LIVE_BANKROLL
+        # 2026-06-24 bankroll fix: pass ledger_writer through so the scanner's
+        # risk_engine writes penny P&L to bankroll_ledger with source='PENNY'.
+        # The writer is provided by main.py -- the scanner itself doesn't
+        # import from performance (isolation rule).
+        self.risk_engine = PennyRiskEngine(
+            bankroll=bankroll, ledger_writer=ledger_writer,
+        )
+        # Executor handles the entry LIMIT -> fill poll -> SL-M -> unwind flow
+        # (spec §7.2). The scanner logs + delegates; the executor places orders.
+        self.executor = PennyExecutor(
+            kite=kite,
+            paper_mode=paper_mode,
+            fill_timeout_sec=settings.PENNY_ENTRY_FILL_TIMEOUT_SEC,
+            poll_interval_sec=2.0,
+            event_sink=self._execution_event_sink,
+        )
+        if daily_pnl_override is not None:
+            self.risk_engine.daily_pnl = daily_pnl_override
+            # [ROADMAP-3.7 2026-07-12] Same IST day-keying as the
+            # kill-switch itself, or the override lands on the wrong
+            # "day" between 00:00 and 05:30 IST.
+            self.risk_engine.daily_pnl_date = self.risk_engine._trading_day()
+
+    async def _execution_event_sink(self, event_type: str, payload: dict, context: dict) -> None:
+        from config import settings
+        await append_execution_event(
+            settings.DB_PATH, event_type=event_type, payload=payload, **context,
+        )
+
+    async def _record_execution_event(self, event_type: str, payload: dict, context: dict) -> bool:
+        """Scanner-side journal writes are loud but never order-critical."""
+        try:
+            return await self._execution_event_sink(event_type, payload, context)
+        except Exception as exc:
+            logger.error("penny_execution_journal_failed event=%s error=%s",
+                         event_type, str(exc))
+            return False
+
+    # ---- [AUDIT-FIX-1.3] regime property + helper -------------------
+
+    @staticmethod
+    def _normalise_regime_getter(regime):
+        """Convert the constructor's `regime` argument into a zero-arg
+        callable returning a PennyRegime string.
+
+        Behaviour:
+          - callable (incl. bound method) -> used as-is
+          - str                          -> wrapped: always returns that string
+                                         (legacy frozen behaviour, preserved
+                                         for any existing call sites that
+                                         pass a string)
+          - None                         -> wrapped: always returns
+                                         "PR2_ELEVATED" ([ROADMAP-3.6]
+                                         defensive default: no regime
+                                         wired = reduced sizing, was
+                                         PR1_CALM full size)
+        """
+        if callable(regime):
+            return regime
+        if isinstance(regime, str):
+            frozen = regime
+            return lambda: frozen
+        # None or anything else
+        return lambda: "PR2_ELEVATED"
+
+    @property
+    def regime(self) -> str:
+        """Live regime value.
+
+        Returns the current regime string. When the scanner was built
+        with a callable (the production wiring), this re-reads the
+        regime engine on every access -- so PR3_HOT transitions mid-day
+        are visible to the 30s MIS scan loop without rebuilding the
+        singleton.
+
+        When the scanner was built with a string, this returns the
+        frozen string (legacy behaviour, preserved for tests).
+        """
+        try:
+            v = self._regime_getter()
+        except Exception as e:
+            # [AUDIT-FIX-1.3] Fail-open: if the regime getter throws
+            # (e.g. the regime engine was never initialised in a test),
+            # return "UNKNOWN" -- which sizes at 0% per the risk engine's
+            # _risk_pct_for_regime table. Better to skip than to crash
+            # the scanner loop.
+            logger.warning("penny_regime_getter_failed error=%s", str(e))
+            return "UNKNOWN"
+        if not v:
+            return "UNKNOWN"
+        # Always return the .value string (handle PennyRegime enum too)
+        try:
+            from penny_models import PennyRegime
+            if isinstance(v, PennyRegime):
+                return v.value
+        except Exception as e:
+            # [ROADMAP-4.3 2026-07-13] Benign (str(v) below is a fine
+            # fallback), but never invisible -- if PennyRegime ever fails to
+            # import, every regime string in the system silently changes
+            # shape and the gates start comparing against a repr.
+            logger.debug("penny_regime_enum_coerce_failed error=%s", str(e))
+        return str(v)
+
+    @regime.setter
+    def regime(self, value):
+        """Setter preserved for back-compat. Sets the regime to a
+        frozen string (legacy callers expecting .regime = "..." to
+        work). For live-tracking, prefer passing a callable to __init__.
+        """
+        self._regime_getter = self._normalise_regime_getter(value)
+
+    def _load_universe(self) -> List[dict]:
+        try:
+            u = PennyUniverse(
+                json_path=self.universe_json_path,
+                instrument_cache=self.kite.instrument_cache,
+            )
+            return u.eligible_tickers()
+        except Exception as e:
+            logger.error("penny_universe_load_failed error=%s", str(e))
+            return []
+
+    async def _wait_for_instrument_cache(
+        self, min_count: Optional[int] = None, timeout: float = 60.0,
+    ) -> bool:
+        """[PENNY-STARTUP-GATE 2026-07-02] Wait for the kite
+        instrument_cache to be populated before running the scanner.
+
+        Today's bug: refresh_instrument_cache() runs async on a parallel
+        task, while run_penny_scanner_once fires on a 30s interval
+        cron. On a fresh container restart, the first 12 minutes of
+        scans ran with an EMPTY instrument_cache, logging
+        `penny_universe_tokens_unresolved count=100` on every tick.
+        The scanner then proceeded with `reject=0` -- no candidate
+        could be tokenised, no signals generated, no orders placed.
+
+        Fix: scan_once() awaits this helper first. If the cache has
+        fewer than `min_count` entries (default 100, well below
+        NSE_EQ's ~2,000), wait up to `timeout` seconds for it to
+        fill. Once full, subsequent scans skip the wait (it's <1ms
+        when the cache is already populated).
+
+        Returns True if the cache is ready (either immediately or
+        after waiting), False if the timeout elapsed. A False return
+        causes scan_once to short-circuit to `accept=0 reject=0`
+        with a logged warning -- better than 12 minutes of false
+        silence.
+
+        `min_count` defaults to the instance-level attribute
+        `instrument_cache_min_count` (default 100) so tests can
+        override without rewiring production code.
+        """
+        if min_count is None:
+            min_count = getattr(self, "instrument_cache_min_count", 100)
+        # Fast path: cache already populated.
+        if len(self.kite.instrument_cache) >= min_count:
+            return True
+        # Slow path: wait up to `timeout` seconds for refresh.
+        deadline = asyncio.get_event_loop().time() + timeout
+        poll_interval = 1.0
+        attempts = 0
+        while asyncio.get_event_loop().time() < deadline:
+            attempts += 1
+            await asyncio.sleep(poll_interval)
+            if len(self.kite.instrument_cache) >= min_count:
+                logger.info(
+                    "penny_instrument_cache_ready attempts=%d size=%d",
+                    attempts, len(self.kite.instrument_cache),
+                )
+                return True
+        logger.warning(
+            "penny_instrument_cache_timeout attempts=%d size=%d "
+            "min_required=%d -- scan will skip this tick",
+            attempts, len(self.kite.instrument_cache), min_count,
+        )
+        return False
+
+    async def _get_quote_safe(self, token) -> Optional[dict]:
+        # [INSTRUMENT-CACHE-INT 2026-07-03] Coerce to int -- the instrument
+        # cache may be populated from the CSV `refresh_instrument_cache`
+        # path (str values, pre-fix) or the JSON `get_instruments_nse_eq`
+        # path (int values, correct). Coercion here makes the consumer
+        # safe for both. The /quote response is keyed by int via
+        # `KiteClient.get_quote`'s `result = {int(k): v for k, v in ...}`,
+        # so the dict lookup needs an int key.
+        try:
+            token_int = int(token)
+        except (TypeError, ValueError):
+            logger.warning(
+                "penny_quote_token_coerce_failed token=%s type=%s",
+                token, type(token).__name__,
+            )
+            return None
+        try:
+            quotes = await self.kite.get_quote([token_int])
+            return quotes.get(token_int) if isinstance(quotes, dict) else None
+        except Exception as e:
+            logger.error("penny_quote_fetch_failed token=%s error=%s", token_int, str(e))
+            return None
+
+    def _regime_to_size_pct(self) -> float:
+        from penny_regime import PennyRegimeEngine
+        try:
+            r = PennyRegime(self.regime)
+        except ValueError:
+            return 0.0
+        return PennyRegimeEngine().size_pct(r)
+
+    async def _evaluate_ticker_breakout(
+        self, ticker: str, as_of: datetime,
+        prev_close: Optional[float] = None,
+        day_low: Optional[float] = None,  # passed through from quote; defaults to None for tests
+        quote_map: Optional[dict] = None,  # [FIX-PHASE3-AUDIT 2026-07-09] batched /quote prefetch
+        shadow_collector: Optional[list] = None,
+    ) -> Optional[dict]:
+        """Run the MIS Breakout evaluator on one ticker.
+
+        Real 1-min intraday bars (per Uru 2026-06-22 deviation):
+        - breakout_bar: latest complete 1-min candle (open/high/low/close/volume)
+          fetched via kite.get_intraday(interval="minute"). The in-progress
+          bar (whose timestamp minute == current minute) is dropped.
+        - median_vol_20d: median cumulative volume of last 20 daily bars
+          (from kite.get_historical for the same ticker).
+        - rsi_14: Wilder 14-period RSI computed locally from the 1-min closes.
+          Computed via penny_engine_breakout._rsi_14_wilder to keep the
+          isolation rule (no import from engine.py).
+        - day_high: from the live quote ohlc.high, fallback to ltp.
+        - cum_vol: live cumulative volume from the quote snapshot.
+        """
+        from penny_engine_breakout import (
+            evaluate_breakout_entry,
+            _rsi_14_wilder,
+        )
+        token = self.kite.instrument_cache.get(ticker)
+        if token is None:
+            logger.warning("penny_eval_skipped ticker=%s reason=token_unresolved", ticker)
+            return {"accept": False, "reject_reason": "token_unresolved", "ticker": ticker}
+
+        # 1) Live quote for LTP, day high, and cumulative volume.
+        # [FIX-PHASE3-AUDIT 2026-07-09] Prefer the batched prefetch from
+        # scan_once (one /quote call for the whole universe, Kite allows
+        # up to 500 instruments per call) over a per-ticker call. The
+        # per-ticker path was 100 HTTP requests per 30s scan against a
+        # GLOBAL 3 req/s limiter shared with the momentum + swing
+        # screeners -- penny was starving them. Fallback to the single
+        # call keeps old tests and direct callers working.
+        q = None
+        if quote_map:
+            try:
+                q = quote_map.get(int(token))
+            except (TypeError, ValueError):
+                q = None
+        if q is None:
+            q = await self._get_quote_safe(token)
+        if not q:
+            logger.warning("penny_eval_skipped ticker=%s reason=quote_unavailable", ticker)
+            return {"accept": False, "reject_reason": "quote_unavailable", "ticker": ticker}
+        ltp = q.get("last_price", 0)
+        cum_vol = q.get("volume", 0) or 0
+        ohlc = q.get("ohlc") or {}
+        day_high = ohlc.get("high") or ltp
+        day_low = ohlc.get("low") or ltp
+
+        # [FIX-PHASE2-AUDIT 2026-07-09] Wire NSE circuit-band filter
+        # (PennyRiskEngine.circuit_blocked, spec §7.4) into the MIS-leg
+        # scanner. The function was implemented but never called from
+        # anywhere except tests. Now that prev_close comes through from
+        # the universe record at the call site, we can enforce the
+        # "stay away from stocks at the daily price band" rule and
+        # avoid the -5%/ATM-trap risk the spec §4.3 warns about.
+        if prev_close and prev_close > 0:
+            try:
+                # [ROADMAP-3.9 2026-07-12] Real band from the quote's
+                # circuit-limit fields; falls back to range inference.
+                band_pct = PennyRiskEngine.band_pct_from_quote(
+                    quote=q,
+                    prev_close=float(prev_close),
+                    day_high=float(day_high) if day_high else float(prev_close),
+                    day_low=float(day_low) if day_low else float(prev_close),
+                )
+                blocked, block_reason = self.risk_engine.circuit_blocked(
+                    last_price=float(ltp), day_high=float(day_high),
+                    prev_close=float(prev_close), band_pct=band_pct,
+                )
+                if blocked:
+                    logger.info(
+                        "penny_circuit_blocked ticker=%s band=%.2f%% ltp=%.2f day_high=%.2f "
+                        "prev_close=%.2f reason=%s",
+                        ticker, band_pct * 100, ltp, day_high, prev_close, block_reason,
+                    )
+                    return {
+                        "accept": False,
+                        "reject_reason": f"circuit_blocked: {block_reason}",
+                        "ticker": ticker,
+                    }
+            except Exception as e:
+                # Never let a circuit-check error crash the scan.
+                logger.warning("penny_circuit_check_failed ticker=%s error=%s",
+                               ticker, str(e))
+
+        # [ROADMAP-3.10 2026-07-12] Earnings/event no-trade window
+        # (operator-curated CSV; missing CSV/ticker = allow). Results-day
+        # gaps jump stops -- don't enter INTO a known event.
+        ev_blocked, ev_reason = _event_block_safe(ticker, as_of.date())
+        if ev_blocked:
+            logger.info("penny_event_blocked ticker=%s reason=%s", ticker, ev_reason)
+            return {"accept": False, "reject_reason": ev_reason, "ticker": ticker}
+
+        # 2) Real 1-min bars (cached by kite.get_intraday)
+        try:
+            today = as_of.strftime("%Y-%m-%d")
+            start_dt = f"{today} 09:15:00"
+            end_dt = as_of.strftime("%Y-%m-%d %H:%M:%S")
+            intraday = await self.kite.get_intraday(
+                ticker=ticker,
+                from_datetime=start_dt,
+                to_datetime=end_dt,
+                interval="minute",
+            )
+        except Exception as e:
+            logger.error("penny_intraday_fetch_failed ticker=%s error=%s", ticker, str(e))
+            return {"accept": False, "reject_reason": "intraday_fetch_failed", "ticker": ticker}
+
+        if intraday is None or len(intraday) < 2:
+            # Not enough data; the day is too early or the feed is down
+            logger.warning(
+                "penny_eval_skipped ticker=%s reason=insufficient_intraday_bars "
+                "bars=%s", ticker, 0 if intraday is None else len(intraday),
+            )
+            return {"accept": False, "reject_reason": "insufficient_intraday_bars", "ticker": ticker}
+
+        # 3) Drop the in-progress bar (its timestamp minute == current minute)
+        # and use the last COMPLETE 1-min bar as the breakout bar.
+        # intraday index is a DatetimeIndex from kite_client.
+        try:
+            last_ts = intraday.index[-1]
+            if hasattr(last_ts, "minute") and last_ts.minute == as_of.minute                     and last_ts.hour == as_of.hour and last_ts.date() == as_of.date():
+                intraday = intraday.iloc[:-1]
+        except Exception:
+            pass  # if we cannot index, fall through with the full df
+
+        if len(intraday) < 1:
+            logger.warning(
+                "penny_eval_skipped ticker=%s reason=zero_complete_bars_after_drop",
+                ticker,
+            )
+            return {"accept": False, "reject_reason": "zero_complete_bars_after_drop", "ticker": ticker}
+
+        last_bar = intraday.iloc[-1]
+        breakout_bar = {
+            "open":   float(last_bar.get("open", ltp)),
+            "high":   float(last_bar.get("high", ltp)),
+            "low":    float(last_bar.get("low",  ltp)),
+            "close":  float(last_bar.get("close", ltp)),
+            "volume": int(last_bar.get("volume", 0) or 0),
+        }
+
+        # [FIX-PHASE3-AUDIT 2026-07-09] The breakout anchor must be the
+        # high of the bars STRICTLY BEFORE the breakout bar. Pre-fix we
+        # passed the live quote's ohlc.high (the running intraday high,
+        # which already includes the breakout bar itself), so
+        # `bar_close > day_high * 1.003` was unsatisfiable by definition:
+        # a bar's close can never exceed the running day high that
+        # includes its own high. Audit of 215,814 lifetime evaluations in
+        # /data/penny_signals.csv: zero accepts, and max observed
+        # close/anchor = 1.0002 vs the required 1.003. A close CAN exceed
+        # the max high of the *prior* bars -- that is what a breakout is.
+        if len(intraday) < 2:
+            logger.info(
+                "penny_eval_skipped ticker=%s reason=no_prior_bars_for_anchor",
+                ticker,
+            )
+            return {
+                "accept": False,
+                "reject_reason": "no prior bars to anchor breakout",
+                "ticker": ticker,
+            }
+        try:
+            prior_bars_high = float(intraday["high"].iloc[:-1].max())
+        except Exception as e:
+            logger.warning(
+                "penny_prior_high_failed ticker=%s error=%s (fallback=quote day_high)",
+                ticker, str(e),
+            )
+            prior_bars_high = day_high
+
+        # 4) Real 20-day median cumulative volume
+        try:
+            from datetime import timedelta
+            from_date = (as_of - timedelta(days=30)).strftime("%Y-%m-%d")
+            to_date = today
+            daily = await self.kite.get_historical(
+                ticker=ticker, from_date=from_date, to_date=to_date
+            )
+            if daily is not None and len(daily) >= 5 and "volume" in daily.columns:
+                median_vol_20d = int(daily["volume"].tail(20).median() or 0)
+            else:
+                median_vol_20d = 0
+        except Exception as e:
+            logger.error("penny_daily_vol_fetch_failed ticker=%s error=%s", ticker, str(e))
+            median_vol_20d = 0
+
+        if median_vol_20d <= 0:
+            # No usable 20-day baseline. Reject rather than accept on a
+            # fabricated number (deviation: was hardcoded 10_000).
+            # NOTE: this is a STRUCTURED REJECT, not a silent skip, so
+            # we return a dict instead of None to surface the reason
+            # in the hourly diagnostic breakdown (2026-06-25).
+            logger.info(
+                "penny_eval_skipped ticker=%s reason=no_20d_median_volume",
+                ticker,
+            )
+            return {
+                "accept": False,
+                "reject_reason": "no 20-day median volume baseline",
+                "ticker": ticker,
+            }
+
+        # 5) Real RSI(14) from the 1-min closes
+        closes_1m = [float(c) for c in intraday["close"].tolist()]
+        rsi_14 = _rsi_14_wilder(closes_1m)
+
+        # [FIX-PHASE2-AUDIT 2026-07-09] Feed per-ticker realized vol rank
+        # into the day's regime classifier (spec §6.2, 40% weight). Pre-fix
+        # update_vol_rank was never called, so _vol_rank stayed None and
+        # classify() always returned PR1_CALM via the fail-open branch.
+        # We compute once per ticker using the 1-min closes (which we
+        # already have). The engine picks the WORST (highest) rank across
+        # the universe to be conservative.
+        try:
+            from penny_regime import PennyRegimeEngine
+            # [ROADMAP-3.6 2026-07-12] bars_per_day=375 scales the 1-min
+            # stdev to a daily equivalent -- without it the 0.10 cap made
+            # vol_rank ~0 for every ticker (the input was dead weight).
+            _regime_engine = PennyRegimeEngine()
+            # [TIER0-0.4 2026-07-14] Key the rank by ticker. The engine now takes
+            # the MEDIAN across the universe rather than the running max, so each
+            # ticker must OVERWRITE its own previous reading -- unkeyed, every
+            # 30-second scan tick would append another entry and the median would
+            # drift with scan count instead of tracking the market.
+            _regime_engine.update_vol_rank(
+                _regime_engine.compute_vol_rank(closes_1m, bars_per_day=375),
+                ticker=ticker,
+            )
+        except Exception as e:
+            # Never let regime-feeding crash a scan tick.
+            logger.warning("penny_vol_rank_feed_failed ticker=%s error=%s",
+                           ticker, str(e))
+
+        decision = evaluate_breakout_entry(
+            ticker=ticker, cum_vol_today=cum_vol, median_vol_20d=median_vol_20d,
+            # [FIX-PHASE3-AUDIT 2026-07-09] prior_bars_high, NOT the live
+            # quote's running day high -- see the anchor comment above.
+            breakout_bar=breakout_bar, day_high=prior_bars_high, rsi_14=rsi_14,
+            as_of=as_of, risk_engine=self.risk_engine,
+            # [TIER2-BREAKOUT-REFINEMENT 2026-06-25] Pass intraday so the
+            # breakout engine can compute VWAP and adaptive threshold.
+            # The engine uses intraday only if PENNY_BREAKOUT_USE_VWAP
+            # or PENNY_BREAKOUT_ADAPTIVE_THRESHOLD is True; otherwise the
+            # param is ignored and behaviour is identical to pre-fix.
+            intraday=intraday,
+            # [FIX-PHASE1-AUDIT 2026-07-09] Pass the day's penny regime so
+            # the engine honours the spec §6.3 ladder:
+            #   PR1_CALM     -> full risk budget
+            #   PR2_ELEVATED -> half risk budget
+            #   PR3_HOT      -> no new entries (rejected pre-sizing)
+            # self.regime is a PennyRegime enum (or string-compatible) read
+            # via _normalise_regime_getter above; the engine coerces if needed.
+            regime=PennyRegime(self.regime),
+        )
+        if isinstance(decision, dict):
+            # Identity uses the last fully closed, evaluator-visible 1m bar,
+            # not the 30-second scheduler timestamp.
+            _visible_bar = intraday.index[-1]
+            decision["_evaluation_bar_ts"] = (
+                _visible_bar.isoformat()
+                if hasattr(_visible_bar, "isoformat")
+                else str(_visible_bar)
+            )
+        if shadow_collector is not None:
+            try:
+                shadow_collector.extend(evaluate_penny_shadows(
+                    ticker=ticker,
+                    cum_vol_today=cum_vol,
+                    median_vol_20d=median_vol_20d,
+                    breakout_bar=breakout_bar,
+                    day_high=prior_bars_high,
+                    rsi_14=rsi_14,
+                    as_of=as_of,
+                    risk_engine=self.risk_engine,
+                    intraday=intraday,
+                    regime=PennyRegime(self.regime),
+                    trading_date=as_of.date(),
+                    bar_ts=intraday.index[-1],
+                ))
+            except Exception as exc:
+                logger.warning(
+                    "penny_shadow_evaluation_failed ticker=%s error=%s",
+                    ticker, str(exc),
+                )
+        return decision
+
+    async def _evaluate_ticker_connors(
+        self, ticker: str, as_of: datetime,
+        prev_close: Optional[float] = None,
+        day_low: Optional[float] = None,  # unused here but kept for symmetry with breakout
+        # Inherit new params with default None: callers from older test
+        # signatures still work.
+        **kwargs,
+    ) -> Optional[dict]:
+        """Run the CNC Connors evaluator on one ticker.
+
+        [PENNY-CONNORS-VOL 2026-06-25] The volume sanity gate in
+        evaluate_connors_entry (line 124 of penny_engine_connors.py)
+        requires today_volume >= 0.5 * avg20_volume. Previously this
+        method hard-coded today_volume=50_000 / avg20_volume=100_000
+        which made the volume gate a constant pass-through -- any
+        ticker with valid SMA+RSI that hit the Connors trigger was
+        accepted regardless of actual volume. Now we compute real
+        today_volume from the latest daily bar and avg20_volume from
+        the 20-day median of daily volume, mirroring the breakout
+        path. If volume cannot be computed (missing column, etc.) we
+        return None to be safe -- a phantom signal is worse than no
+        signal at this bankroll.
+        """
+        from penny_engine_connors import evaluate_connors_entry
+        token = self.kite.instrument_cache.get(ticker)
+        if token is None:
+            logger.warning("penny_eval_skipped ticker=%s reason=token_unresolved", ticker)
+            return {"accept": False, "reject_reason": "token_unresolved", "ticker": ticker}
+        # Need 250+ daily closes for the SMA + RSI trend filter.
+        #
+        # [DAILY-DEPTH 2026-08-04] from_date was the hard-coded literal
+        # "2025-01-01". It satisfied the 250-bar floor, but it also silently
+        # capped how much daily history this system can ever hold: every penny
+        # ticker in ohlcv_cache has exactly 394 bars because that is the
+        # distance from that literal to today. When the Connors book was
+        # finally backtested, only ~140 evaluation days per ticker existed,
+        # and the whole 2.5-year study produced a single signal at the default
+        # gates -- not because the strategy is that rare, but because there was
+        # not enough history to find out.
+        #
+        # A fixed anchor is wrong in both directions: it starves research now,
+        # and it silently widens the fetch window every day forever. A rolling
+        # lookback is bounded and gives the cache a real corpus to accumulate.
+        # settings is imported per-scope in this module (see line ~90), not at
+        # module level, so it must be imported here too.
+        from config import settings as _cfg
+        from datetime import timedelta as _td
+        _from = (as_of - _td(days=_cfg.DAILY_HISTORY_DAYS)).strftime("%Y-%m-%d")
+        try:
+            bars = await self.kite.get_historical(
+                ticker=ticker,
+                from_date=_from,
+                to_date=as_of.strftime("%Y-%m-%d"),
+            )
+        except Exception as e:
+            logger.error("penny_historical_failed ticker=%s error=%s", ticker, str(e))
+            bars = None
+        if bars is None:
+            logger.warning("penny_eval_skipped ticker=%s reason=historical_unavailable", ticker)
+            return {"accept": False, "reject_reason": "historical_unavailable", "ticker": ticker}
+        n = len(bars) if hasattr(bars, '__len__') else 0
+        if n < 250:
+            logger.warning("penny_eval_skipped ticker=%s reason=insufficient_history bars=%d", ticker, n)
+            return {"accept": False, "reject_reason": "insufficient_history", "ticker": ticker}
+        # Real volume extraction (P1a). If the column is missing or
+        # unusable, return None rather than fabricate numbers.
+        today_volume = 0
+        avg20_volume = 0
+        if hasattr(bars, 'columns') and 'volume' in bars.columns:
+            try:
+                vol_series = bars["volume"].tail(21)  # 21 to allow median of last 20
+                today_volume = int(vol_series.iloc[-1] or 0)
+                avg20_volume = int(vol_series.tail(20).median() or 0)
+            except Exception as e:
+                logger.warning(
+                    "penny_eval_skipped ticker=%s reason=volume_extract_failed error=%s",
+                    ticker, str(e),
+                )
+                return {"accept": False, "reject_reason": "volume_extract_failed", "ticker": ticker}
+        else:
+            logger.warning(
+                "penny_eval_skipped ticker=%s reason=no_volume_column",
+                ticker,
+            )
+            return {"accept": False, "reject_reason": "no_volume_column", "ticker": ticker}
+        if hasattr(bars, 'columns'):
+            # pandas DataFrame
+            closes = bars["close"].tolist() if "close" in bars.columns else []
+        else:
+            closes = [b["close"] for b in bars if b.get("close")]
+        daily = {"closes": closes}
+
+        # [FIX-PHASE2-AUDIT 2026-07-09] Also feed vol_rank from the
+        # Connors path. The daily closes we already have are perfect
+        # input for compute_vol_rank (250 bars gives a robust 60d proxy).
+        # The scanner's per-scan-tick universe is small (~78 tickers),
+        # so this is one extra divide per ticker.
+        try:
+            from penny_regime import PennyRegimeEngine
+            # [TIER0-0.4] Keyed by ticker -- see the MIS path above.
+            PennyRegimeEngine().update_vol_rank(
+                PennyRegimeEngine().compute_vol_rank(closes),
+                ticker=ticker,
+            )
+        except Exception as e:
+            logger.warning("penny_vol_rank_feed_failed ticker=%s error=%s",
+                           ticker, str(e))
+
+        # [FIX-PHASE2-AUDIT 2026-07-09] Circuit-block check for the
+        # Connors path. We fetch a quote (cache hit in production) and
+        # run the same PennyRiskEngine.circuit_blocked guard as the
+        # breakout engine so both legs respect the band filter.
+        if prev_close and prev_close > 0:
+            try:
+                q = await self._get_quote_safe(token)
+                if q:
+                    cnc_ltp = float(q.get("last_price") or 0)
+                    ohlc = q.get("ohlc") or {}
+                    cnc_day_high = float(ohlc.get("high") or cnc_ltp or prev_close)
+                    cnc_day_low = float(ohlc.get("low") or cnc_ltp or prev_close)
+                    # [ROADMAP-3.9 2026-07-12] Real band when available.
+                    band_pct_c = PennyRiskEngine.band_pct_from_quote(
+                        quote=q,
+                        prev_close=float(prev_close),
+                        day_high=cnc_day_high, day_low=cnc_day_low,
+                    )
+                    blocked, block_reason = self.risk_engine.circuit_blocked(
+                        last_price=cnc_ltp, day_high=cnc_day_high,
+                        prev_close=float(prev_close), band_pct=band_pct_c,
+                    )
+                    if blocked:
+                        logger.info(
+                            "penny_circuit_blocked_connors ticker=%s band=%.2f%% ltp=%.2f "
+                            "day_high=%.2f prev_close=%.2f reason=%s",
+                            ticker, band_pct_c * 100, cnc_ltp, cnc_day_high,
+                            prev_close, block_reason,
+                        )
+                        return {
+                            "accept": False,
+                            "reject_reason": f"circuit_blocked: {block_reason}",
+                            "ticker": ticker,
+                        }
+            except Exception as e:
+                logger.warning("penny_connors_circuit_check_failed ticker=%s error=%s",
+                               ticker, str(e))
+
+        # [ROADMAP-3.10 2026-07-12] Same event window as the MIS leg --
+        # a CNC overnight hold through results is the worst version of
+        # the stop-jump risk.
+        ev_blocked, ev_reason = _event_block_safe(ticker, as_of.date())
+        if ev_blocked:
+            logger.info(
+                "penny_event_blocked_connors ticker=%s reason=%s", ticker, ev_reason
+            )
+            return {"accept": False, "reject_reason": ev_reason, "ticker": ticker}
+
+        decision = evaluate_connors_entry(
+            ticker=ticker, daily=daily,
+            today_volume=today_volume, avg20_volume=avg20_volume,
+            regime_size_pct=self._regime_to_size_pct(),
+            risk_engine=self.risk_engine, as_of=as_of,
+        )
+        if not decision or not decision.get("accept"):
+            return decision
+
+        # [TIER2-TIME-OF-DAY 2026-06-25] Reject late-day CNC signals.
+        # Connors RSI(2) is a morning mean-reversion signal -- after lunch
+        # the signal is much less reliable because:
+        #   - morning gaps have already played out
+        #   - afternoon volume is thinner, so fills + SL-M protection are
+        #     both less robust
+        #   - the operator can no longer react to a midday trigger before
+        #     EOD
+        # PENNY_CONNORS_LAST_ENTRY_MIN=195 (12:30 IST) is the default;
+        # 0 disables. The check is intentionally simple: minutes since
+        # 09:15 IST. We could use market_calendar-aware sunrise but the
+        # signal is independent of holidays (just time-of-day).
+        from config import settings as _settings
+        last_entry_min = _settings.PENNY_CONNORS_LAST_ENTRY_MIN
+        if last_entry_min > 0:
+            market_open = as_of.replace(hour=9, minute=15, second=0, microsecond=0)
+            minutes_since_open = (as_of - market_open).total_seconds() / 60.0
+            if minutes_since_open > last_entry_min:
+                logger.info(
+                    "penny_eval_skipped ticker=%s reason=late_day minutes_since_open=%.0f limit=%d",
+                    ticker, minutes_since_open, last_entry_min,
+                )
+                decision["accept"] = False
+                decision["reject_reason"] = (
+                    f"late-day entry blocked (minutes_since_open={minutes_since_open:.0f}, "
+                    f"limit={last_entry_min})"
+                )
+                return decision
+
+        # [PENNY-G2 2026-06-25] Compute real ATR(1min) from today's intraday
+        # bars and include it in the decision so downstream exit logic
+        # (evaluate_connors_exit) can use it for the post-T1 trailing stop.
+        # Previously this was always 0.0 because no caller fetched intraday
+        # for CNC entries -- the trail-stop effectively became a hard floor
+        # at breakeven+0.5% and the ATR component never moved it.
+        # NOTE: run_penny_connors_scan does NOT currently write a CNC
+        # position row to the positions table -- that's a separate fix
+        # (G5 / P3). When that lands, atr_1min_post_t1 will be read from
+        # the position. Until then this is computed but not consumed.
+        try:
+            from datetime import timedelta as _td
+            today = as_of.strftime("%Y-%m-%d")
+            start_dt = f"{today} 09:15:00"
+            end_dt = as_of.strftime("%Y-%m-%d %H:%M:%S")
+            intraday = await self.kite.get_intraday(
+                ticker=ticker,
+                from_datetime=start_dt,
+                to_datetime=end_dt,
+                interval="minute",
+            )
+            if intraday is not None and len(intraday) >= 1:
+                from penny_engine_connors import atr_1min as _atr_1min
+                atr = _atr_1min(intraday)
+                decision["atr_1min_post_t1"] = float(atr)
+            else:
+                decision["atr_1min_post_t1"] = 0.0
+        except Exception as e:
+            logger.warning(
+                "penny_atr_intraday_failed ticker=%s error=%s atr_1min_set_to_0",
+                ticker, str(e),
+            )
+            decision["atr_1min_post_t1"] = 0.0
+        return decision
+
+    async def scan_once(self, as_of: datetime) -> dict:
+        """
+        One full pass: load universe, run BOTH engines per ticker, log results.
+        Used by the 30-second MIS scheduler. CNC engine runs but most tickers
+        will be rejected (insufficient daily data) -- the daily 09:30 scanner
+        is the canonical CNC pass.
+
+        Returns summary dict with counts (accept, reject, error).
+
+        Observability (2026-06-25):
+        - Logs `penny_scan_loop_summary` at start with universe size and
+          degraded-quality count so silent-empty-eligible scenarios
+          surface immediately.
+        - Logs `penny_eval_skipped` at every silent None-return path in
+          the per-ticker evaluator with the actual reason.
+        - Treats a None decision from _evaluate_ticker_breakout as a
+          `reject` with a structured reason (not a silent error count).
+          This matches the CNC path's counting convention.
+        """
+        from config import settings
+        from penny_signal_log import init_penny_signal_db, log_penny_signal
+        scan_id = f"penny-{uuid4().hex[:8]}"
+        # The MIS evaluator cannot accept outside its configured entry window.
+        # Production 2026-09-03 still evaluated and persisted all 70 symbols on
+        # every 09:15-10:29 and 14:30-15:30 tick, creating thousands of
+        # guaranteed ``outside breakout time window`` rows. Position management
+        # is owned by the paper-stop/EOD jobs, so an entry scan has no useful
+        # work in this interval.
+        minute = as_of.hour * 60 + as_of.minute
+        if not (
+            settings.PENNY_BREAKOUT_TIME_START
+            <= minute
+            < settings.PENNY_BREAKOUT_TIME_END
+        ):
+            return _scan_summary(scan_id)
+        # Ensure DB exists
+        await init_penny_signal_db(settings.DB_PATH)
+
+        universe = self._load_universe()
+        # [PENNY-STARTUP-GATE 2026-07-02] If the universe is empty,
+        # check whether the instrument_cache is the reason (race on
+        # container startup). If yes, wait up to 60s for it to fill;
+        # if it never fills, log + return zeros rather than spam
+        # `penny_universe_tokens_unresolved count=100` for 12 minutes.
+        if not universe:
+            cache_size = len(getattr(self.kite, "instrument_cache", {}) or {})
+            if cache_size < 100:
+                if not await self._wait_for_instrument_cache():
+                    return _scan_summary(scan_id)
+                # Cache filled -- reload universe once.
+                universe = self._load_universe()
+            if not universe:
+                # 2026-06-25: surface this loudly so future silent-empty
+                # scenarios don't go unnoticed.
+                logger.warning(
+                    "penny_scan_no_eligible_universe scan_id=%s "
+                    "(check penny_universe_quality_audit + corp_data source)",
+                    scan_id,
+                )
+                return _scan_summary(scan_id)
+
+        # Surface universe size + degraded count at scan start
+        degraded_count = sum(
+            1 for t in universe if (t.get("data_quality") or "").startswith("DEGRADED")
+        )
+        logger.info(
+            "penny_scan_loop_summary scan_id=%s eligible=%d degraded=%d regime=%s",
+            scan_id, len(universe), degraded_count, self.regime,
+        )
+
+        # Regime gate: PR3 blocks all new entries
+        if self.regime == PennyRegime.PR3_HOT.value:
+            for t in universe:
+                await log_penny_signal(
+                    settings.DB_PATH, scan_id=scan_id, ticker=t["symbol"],
+                    leg="MIS", accepted=False,
+                    reject_reason="regime PR3_HOT (no new entries)",
+                    regime=self.regime, close=0.0,
+                )
+            return _scan_summary(scan_id, reject=len(universe))
+
+        # Kill-switch gate
+        if self.risk_engine.kill_switch_active():
+            for t in universe:
+                await log_penny_signal(
+                    settings.DB_PATH, scan_id=scan_id, ticker=t["symbol"],
+                    leg="MIS", accepted=False,
+                    reject_reason="kill_switch active (daily loss limit)",
+                    regime=self.regime, close=0.0,
+                )
+            return _scan_summary(scan_id, reject=len(universe))
+
+        accept = reject = error = 0
+        order_attempt = fill = protected = position = failure = 0
+        shadow_rows = []
+        # [PENNY-G9 2026-06-25] Parallelise the per-ticker evaluation with
+        # asyncio.gather. The previous sequential loop ran ~100 tickers
+        # back-to-back. Each ticker does 3 kite calls (quote, intraday,
+        # historical) gated by the kite_client RateLimiter (3 req/sec,
+        # burst 1). Parallelising lets the limiter queue N requests at
+        # once instead of N serial round-trips, giving an effective
+        # speedup of ~5-10x for 100-ticker universes.
+        #
+        # Sequential steps that stay serial:
+        # - manual disable check (sync, no I/O)
+        # - DB writes (log_penny_signal, positions INSERT) -- these have
+        #   their own aiosqlite connection and concurrent writes could race.
+        # - executor.execute_entry -- places real orders, MUST be serial.
+        #
+        # We therefore split the loop into two phases:
+        # Phase 1 (parallel): evaluate all non-disabled tickers via gather
+        # Phase 2 (serial): for each result, log signal + (if accept) execute
+        surviving = []
+        for t in universe:
+            sym = t["symbol"]
+            if self.risk_engine.is_disabled(sym):
+                await log_penny_signal(
+                    settings.DB_PATH, scan_id=scan_id, ticker=sym,
+                    leg="MIS", accepted=False,
+                    reject_reason=f"disabled via PENNY_DISABLE_TICKERS",
+                    regime=self.regime, close=0.0,
+                )
+                reject += 1
+                continue
+            surviving.append(t)
+
+        # [PENNY-T2C-SECTOR-FILTER 2026-06-25] Load sector CSV once per
+        # scan (not per ticker). Empty CSV or missing file = filter is
+        # effectively OFF (fail-open). The dedupe batch helper below
+        # groups tickers by ETF so we only hit Kite once per unique sector.
+        sector_map: dict = {}
+        if settings.PENNY_USE_SECTOR_FILTER:
+            try:
+                from penny_sector_filter import load_sector_map
+                sector_map = load_sector_map(settings.PENNY_SECTORS_CSV_PATH)
+            except Exception as e:
+                logger.warning("penny_sector_filter_load_failed error=%s (fail-open)", str(e))
+                sector_map = {}
+
+        # [FIX-PHASE3-AUDIT 2026-07-09] Batch-prefetch live quotes for the
+        # whole surviving universe in ONE /quote call (Kite allows up to
+        # 500 instruments per request). Pre-fix each ticker made its own
+        # single-token /quote call: ~100 HTTP requests per 30s scan
+        # against the GLOBAL 3 req/s rate limiter shared with the
+        # momentum and swing screeners. Penny alone needed ~100s per
+        # scan -- overrunning its own 30s cadence AND starving the other
+        # two strategies. Failure here falls back to the per-ticker path
+        # inside _evaluate_ticker_breakout (quote_map=None entries).
+        quote_map: dict = {}
+        if surviving:
+            batch_tokens = []
+            for t in surviving:
+                tok = self.kite.instrument_cache.get(t["symbol"])
+                if tok is None:
+                    continue
+                try:
+                    batch_tokens.append(int(tok))
+                except (TypeError, ValueError):
+                    continue
+            if batch_tokens:
+                try:
+                    quote_map = await self.kite.get_quote(batch_tokens)
+                    if not isinstance(quote_map, dict):
+                        quote_map = {}
+                except Exception as e:
+                    logger.warning(
+                        "penny_quote_batch_prefetch_failed error=%s "
+                        "(fallback=per-ticker quotes)", str(e),
+                    )
+                    quote_map = {}
+
+        # Phase 1a: parallel per-ticker evaluation (breakout engine).
+        # [FIX-PHASE2-AUDIT 2026-07-09] Pass prev_close from each
+        # universe record so circuit_blocked (spec §7.4) can be enforced
+        # inside the evaluator.
+        if surviving:
+            results = await asyncio.gather(
+                *[self._evaluate_ticker_breakout(
+                      t["symbol"], as_of,
+                      prev_close=t.get("prev_close"),
+                      quote_map=quote_map,
+                      shadow_collector=(
+                          shadow_rows
+                          if getattr(settings, "PENNY_SHADOW_ENABLED", True)
+                          else None
+                      ),
+                  )
+                  for t in surviving],
+                return_exceptions=True,
+            )
+        else:
+            results = []
+
+        # Phase 1a (continued): drop records that the breakout engine
+        # rejected so we don't waste Kite calls on the Connors leg.
+        # Still need the *universe record* (t) for connors kwargs (prev_close, etc).
+
+        # Phase 1b: sector check. Only runs on tickers that PASSED the
+        # breakout engine (we don't waste Kite calls on rejects). Uses
+        # the batch dedupe helper so the Kite rate limiter isn't hammered.
+        # The CSV-tickers dict has whatever mapping was loaded (possibly
+        # empty if CSV missing); the helper handles that case.
+        post_breakout = []  # list of (ticker_dict, decision)
+        for t, result in zip(surviving, results):
+            sym = t["symbol"]
+            if isinstance(result, Exception):
+                continue  # handled below
+            if result is None or not result.get("accept"):
+                continue  # not a candidate
+            post_breakout.append((t, result))
+
+        sector_decisions: dict = {}
+        if post_breakout and sector_map:
+            try:
+                from penny_sector_filter import filter_universe_by_sector
+                post_tickers = [td[0]["symbol"] for td in post_breakout]
+                sector_decisions = await filter_universe_by_sector(
+                    tickers=post_tickers,
+                    kite=self.kite,
+                    sector_map=sector_map,
+                    top_losers_pct=settings.PENNY_SECTOR_TOP_LOSERS_PCT,
+                    etf_change_threshold_pct=settings.PENNY_SECTOR_ETF_CHANGE_THRESHOLD_PCT,
+                )
+            except Exception as e:
+                logger.warning("penny_sector_filter_batch_failed error=%s (fail-open)", str(e))
+                sector_decisions = {}
+
+        # Phase 2: serial result processing. Each surviving ticker has a
+        # corresponding result (decision dict or Exception).
+        for t, result in zip(surviving, results):
+            sym = t["symbol"]
+            if isinstance(result, Exception):
+                # Should not normally happen -- the evaluator catches its own
+                # exceptions and returns None -- but be defensive.
+                logger.error(
+                    "penny_ticker_eval_exception ticker=%s error=%s",
+                    sym, str(result),
+                )
+                error += 1
+                continue
+            decision = result
+            if decision is None:
+                # 2026-06-25: this is not a system ERROR -- it is a
+                # structured "skipped" outcome. The evaluator already
+                # logged the specific reason (e.g. penny_intraday_fetch_failed,
+                # penny_daily_vol_fetch_failed). Count it as a reject
+                # so the diagnostic breakdown in the hourly report is
+                # accurate. Also log the DB row so operators can see
+                # the rejection without waiting for the hourly message.
+                logger.info(
+                    "penny_eval_skipped ticker=%s reason=evaluator_returned_none",
+                    sym,
+                )
+                await log_penny_signal(
+                    settings.DB_PATH, scan_id=scan_id, ticker=sym,
+                    leg="MIS", accepted=False,
+                    reject_reason="evaluator returned None (see prior warn/error)",
+                    regime=self.regime, close=0.0,
+                )
+                reject += 1
+                continue
+
+            # [PENNY-T2C-SECTOR-FILTER 2026-06-25] Apply sector gate AFTER
+            # the breakout engine accepts, BEFORE we go to DB + executor.
+            # The gate is fail-open: UNKNOWN -> ALLOW. REJECT -> structured
+            # reject with a sector-specific reason in the diagnostic
+            # breakdown.
+            if decision.get("accept") and sym in sector_decisions:
+                sd = sector_decisions[sym]
+                if sd.is_blocked:
+                    logger.info(
+                        "penny_sector_filter_rejected ticker=%s sector=%s etf=%s change=%.2f%% reason=%s",
+                        sym, sd.sector, sd.etf_symbol,
+                        (sd.etf_change_pct or 0) * 100,
+                        sd.reason,
+                    )
+                    await log_penny_signal(
+                        settings.DB_PATH, scan_id=scan_id, ticker=sym,
+                        leg="MIS", accepted=False,
+                        reject_reason=f"sector_filter: {sd.reason}",
+                        regime=self.regime, close=0.0,
+                    )
+                    reject += 1
+                    continue
+
+            if not decision.get("accept"):
+                await log_penny_signal(
+                    settings.DB_PATH, scan_id=scan_id, ticker=sym,
+                    leg="MIS", accepted=False,
+                    reject_reason=decision.get("reject_reason", ""),
+                    regime=self.regime, close=0.0,
+                )
+                reject += 1
+            else:
+                # Log accept + delegate to executor (per 2026-06-22 deviation).
+                # The executor handles the full entry flow per spec §7.2:
+                # entry LIMIT -> fill poll -> SL-M with retry -> market-unwind.
+                await log_penny_signal(
+                    settings.DB_PATH, scan_id=scan_id, ticker=sym,
+                    leg="MIS", accepted=True,
+                    regime=self.regime, close=decision.get("entry", 0.0),
+                    stop_loss=decision.get("stop_loss"),
+                    target_1=decision.get("target"),
+                    rsi_14=decision.get("rsi_14"),
+                    breakout_level=decision.get("breakout_level"),
+                    shares=decision.get("shares"),
+                )
+                evaluation_bar_ts = str(decision.get("_evaluation_bar_ts") or as_of.isoformat())
+                candidate_identity = "|".join((
+                    as_of.date().isoformat(), evaluation_bar_ts, sym, "MIS", "PEN_BASE",
+                    str(decision.get("entry")), str(decision.get("stop_loss")),
+                ))
+                attempt_id, candidate_key = attempt_identity(
+                    candidate_identity, sym, "MIS", self.source_tag,
+                )
+                event_context = {
+                    "attempt_id": attempt_id, "scan_id": scan_id,
+                    "candidate_key": candidate_key, "ticker": sym, "leg": "MIS",
+                    "source": self.source_tag,
+                    "mode": "paper" if self.paper_mode else "live",
+                }
+                await self._record_execution_event("CANDIDATE_ACCEPTED", {
+                    "signal_entry": decision.get("entry"),
+                    "stop_loss": decision.get("stop_loss"),
+                    "target": decision.get("target"), "quantity": decision.get("shares"),
+                }, event_context)
+                try:
+                    lifecycle = await attempt_event_types(settings.DB_PATH, attempt_id)
+                except Exception as exc:
+                    # Cannot prove this deterministic attempt has not already
+                    # reached the broker. Fail closed rather than double-buy.
+                    logger.critical(
+                        "penny_execution_reconciliation_UNRESOLVED ticker=%s "
+                        "attempt_id=%s reason=journal_unreadable error=%s -- refusing re-entry",
+                        sym, attempt_id, str(exc),
+                    )
+                    failure += 1
+                    accept += 1
+                    continue
+                if "EXECUTION_RESULT" in lifecycle:
+                    try:
+                        result_evidence = await attempt_event_payload(
+                            settings.DB_PATH, attempt_id, "EXECUTION_RESULT",
+                        )
+                    except Exception as exc:
+                        logger.critical(
+                            "penny_execution_reconciliation_UNRESOLVED ticker=%s "
+                            "attempt_id=%s reason=result_payload_unreadable error=%s "
+                            "-- refusing re-entry", sym, attempt_id, str(exc),
+                        )
+                        failure += 1
+                        accept += 1
+                        continue
+                    protected_result = bool(
+                        result_evidence
+                        and result_evidence.get("entry_status") in ("filled", "paper")
+                        and result_evidence.get("sl_order_id")
+                        and not result_evidence.get("unwound")
+                    )
+                    if protected_result and "POSITION_CREATED" not in lifecycle:
+                        logger.critical(
+                            "penny_execution_reconciliation_UNRESOLVED ticker=%s "
+                            "attempt_id=%s reason=protected_fill_missing_local_position "
+                            "-- refusing duplicate entry; reconcile broker and local DB",
+                            sym, attempt_id,
+                        )
+                        await self._record_execution_event(
+                            "UNRESOLVED_RECONCILIATION",
+                            {"observed_events": list(lifecycle),
+                             "action": "REFUSED_DUPLICATE_ENTRY",
+                             "reason": "PROTECTED_FILL_MISSING_POSITION"},
+                            event_context,
+                        )
+                        failure += 1
+                        accept += 1
+                        continue
+                    logger.info("penny_execution_attempt_deduped ticker=%s attempt_id=%s",
+                                sym, attempt_id)
+                    accept += 1
+                    continue
+                broker_progress = tuple(event for event in lifecycle if event not in {
+                    "CANDIDATE_ACCEPTED", "UNRESOLVED_RECONCILIATION",
+                })
+                if broker_progress:
+                    logger.critical(
+                        "penny_execution_reconciliation_UNRESOLVED ticker=%s "
+                        "attempt_id=%s lifecycle=%s -- broker progress exists without "
+                        "EXECUTION_RESULT; refusing duplicate entry and requiring reconciliation",
+                        sym, attempt_id, ",".join(broker_progress),
+                    )
+                    await self._record_execution_event(
+                        "UNRESOLVED_RECONCILIATION",
+                        {"observed_events": sorted(broker_progress),
+                         "action": "REFUSED_DUPLICATE_ENTRY"},
+                        event_context,
+                    )
+                    failure += 1
+                    accept += 1
+                    continue
+                try:
+                    from penny_models import PennyLeg
+                    from position_tracker import init_positions_db
+                    await init_positions_db(settings.DB_PATH)
+                    reservation = await reserve_penny_position(
+                        settings.DB_PATH, attempt_id=attempt_id,
+                        source=self.source_tag, ticker=sym, product_type="MIS",
+                        max_total=settings.PENNY_MAX_POSITIONS_TOTAL,
+                        max_leg=settings.PENNY_MAX_POSITIONS_MIS,
+                    )
+                    if not reservation.granted:
+                        logger.info(
+                            "penny_entry_reservation_rejected ticker=%s attempt_id=%s "
+                            "reason=%s total=%d mis=%d",
+                            sym, attempt_id, reservation.reason,
+                            reservation.total_occupied, reservation.leg_occupied,
+                        )
+                        await self._record_execution_event("VALIDATION_REJECTED", {
+                            "status": "capacity_rejected",
+                            "reason": reservation.reason,
+                            "total_occupied": reservation.total_occupied,
+                            "leg_occupied": reservation.leg_occupied,
+                        }, event_context)
+                        failure += 1
+                        accept += 1
+                        continue
+                    order_attempt += 1
+                    order_result = await self.executor.execute_entry(
+                        ticker=sym,
+                        leg=PennyLeg.MIS,
+                        entry_price=decision.get("entry", 0.0),
+                        stop_loss=decision.get("stop_loss", 0.0),
+                        shares=decision.get("shares", 0),
+                        attempt_context=event_context,
+                    )
+                    logger.info(
+                        "penny_entry_attempted ticker=%s entry=%.2f sl=%.2f shares=%d paper=%s order_id=%s",
+                        sym, decision.get("entry", 0.0),
+                        decision.get("stop_loss", 0.0),
+                        decision.get("shares", 0),
+                        order_result.get("paper"),
+                        order_result.get("entry_order_id"),
+                    )
+                    status = order_result.get("entry_status")
+                    fill_price = order_result.get("fill_price")
+                    if status in ("filled", "paper") and fill_price:
+                        fill += 1
+                    is_protected_fill = (
+                        not order_result.get("unwound")
+                        and status in ("filled", "paper")
+                        and bool(order_result.get("sl_order_id"))
+                        and isinstance(fill_price, (int, float)) and fill_price > 0
+                    )
+                    await self._record_execution_event("EXECUTION_RESULT", {
+                        "entry_status": status, "paper": bool(order_result.get("paper")),
+                        "entry_order_id": order_result.get("entry_order_id"),
+                        "sl_order_id": order_result.get("sl_order_id"),
+                        "unwind_order_id": order_result.get("unwind_order_id"),
+                        "unwound": bool(order_result.get("unwound")),
+                        "fill_price": fill_price,
+                        "reject_reason": order_result.get("reject_reason"),
+                    }, event_context)
+                    if is_protected_fill:
+                        protected += 1
+                        from datetime import datetime, timezone
+                        row_id = await persist_reserved_penny_position(
+                            settings.DB_PATH, attempt_id=attempt_id, values={
+                                "ticker": sym, "exchange": "NSE",
+                                "entry_date": datetime.now(timezone.utc).isoformat(),
+                                "entry_price": fill_price,
+                                "shares": decision.get("shares", 0),
+                                "stop_loss_initial": decision.get("stop_loss", 0.0),
+                                "trailing_stop_current": decision.get("stop_loss", 0.0),
+                                "target_1": decision.get("target", 0.0),
+                                "target_2": decision.get("target", 0.0) * 1.05,
+                                "atr_14_at_entry": 0.0,
+                                "highest_close_since_entry": fill_price,
+                                "status": "OPEN", "source": self.source_tag,
+                                "product_type": "MIS", "regime_at_entry": self.regime,
+                                "sl_order_id": order_result.get("sl_order_id"),
+                            },
+                        )
+                        position += 1
+                        await self._record_execution_event("POSITION_CREATED", {
+                            "position_rowid": row_id, "entry_price": fill_price,
+                            "sl_order_id": order_result.get("sl_order_id"),
+                        }, event_context)
+                    else:
+                        failure += 1
+                        if status in {
+                            "ticker_blocked", "drift_rejected",
+                            "stop_already_breached", "no_quote",
+                        } or bool(order_result.get("unwound")):
+                            await set_penny_reservation_state(
+                                settings.DB_PATH, attempt_id=attempt_id,
+                                state="RELEASED", note=f"definitive_no_position:{status}",
+                            )
+                        else:
+                            # Rejections/timeouts can be transport-ambiguous.
+                            # Preserve occupancy until broker reconciliation.
+                            await set_penny_reservation_state(
+                                settings.DB_PATH, attempt_id=attempt_id,
+                                state="UNRESOLVED", note=f"broker_outcome:{status}",
+                            )
+                except Exception as e:
+                    logger.error("penny_entry_wiring_failed ticker=%s error=%s", sym, str(e))
+                    failure += 1
+                    if 'attempt_id' in locals():
+                        try:
+                            await set_penny_reservation_state(
+                                settings.DB_PATH, attempt_id=attempt_id,
+                                state="UNRESOLVED", note=f"exception:{type(e).__name__}",
+                            )
+                        except Exception as reservation_error:
+                            logger.critical(
+                                "penny_reservation_quarantine_failed ticker=%s "
+                                "attempt_id=%s error=%s",
+                                sym, attempt_id, str(reservation_error),
+                            )
+                    if 'event_context' in locals():
+                        await self._record_execution_event("POSITION_PERSIST_FAILED", {
+                            "error_type": type(e).__name__, "message": str(e)[:300],
+                        }, event_context)
+                accept += 1
+
+        # Persist only after every baseline log and order attempt has completed,
+        # so SQLite contention in the research side-channel cannot delay entry.
+        if getattr(settings, "PENNY_SHADOW_ENABLED", True):
+            try:
+                await persist_penny_shadow_results(settings.DB_PATH, shadow_rows)
+            except Exception as exc:
+                logger.warning(
+                    "penny_shadow_persistence_failed evaluations=%d error=%s",
+                    len(shadow_rows), str(exc),
+                )
+
+        return _scan_summary(
+            scan_id, accept=accept, reject=reject, error=error,
+            order_attempt=order_attempt, fill=fill, protected=protected,
+            position=position, failure=failure,
+        )

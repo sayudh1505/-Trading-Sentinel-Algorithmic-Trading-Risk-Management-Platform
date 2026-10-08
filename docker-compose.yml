@@ -1,0 +1,284 @@
+# [ROADMAP-2.2 2026-07-12] Health that ACTS: node/python images already
+# carry HEALTHCHECKs; agent + nginx now have them too, and the autoheal
+# sidecar restarts any labelled container that turns unhealthy (compose
+# alone never restarts wedged-but-alive processes -- the 2026-07-07
+# freeze ran 6h32m, the Telegram bot once wedged ~5h).
+# Deliberately NO `depends_on: condition: service_healthy`: per the
+# operator mandate 2026-06-25, one unhealthy container must never block
+# another from starting during market hours; startup order stays
+# best-effort and each service degrades independently.
+#
+# [ROADMAP-2.7 2026-07-12] mem_limit/cpus on every service. These are
+# host-protection caps, not tuning: observed steady-state usage is
+# nginx ~14M / node ~110M / python ~160M / agent ~100M on a 15G/12-cpu
+# host, so every cap is 5-20x headroom. The failure they prevent is one
+# runaway pandas scan OOMing the HOST and taking all containers down
+# together; with a cap, the kernel kills only the offender, and
+# restart: + autoheal (2.2) + token re-arm (2.1) bring it back armed.
+services:
+  # The Shield: Nginx Reverse Proxy
+  nginx:
+    image: nginx:alpine
+    container_name: quant_nginx
+    restart: always
+    mem_limit: 128m
+    cpus: 1
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./node-gateway/nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    networks:
+      - sentinel-net
+    depends_on:
+      - node-gateway
+    labels:
+      - autoheal=true
+    healthcheck:
+      # /nginx-health is answered by nginx itself (no upstream), so a
+      # node-gateway outage can't mark nginx unhealthy.
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/nginx-health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    # [ROADMAP-2.8 2026-07-12] 10m x 3 kept ~a day of forensics; the
+    # 2026-07-09 postmortem already hit deleted evidence. 20m x 10
+    # stretches retention for ~40M real disk per container (host disk is
+    # 86% full -- caps stay modest).
+    #
+    # [LOG-READABILITY 2026-07-31] compress:"true" REMOVED. Gzipped rotated
+    # files made `docker logs` silently truncate: the engine returned 254k
+    # lines with no flags but only 13k with --tail 5000000, and --tail 20
+    # could reach lines neither of the others could. node-gateway was
+    # readable only ~5000 lines back. The whole of Tue 2026-07-28 was
+    # unrecoverable from the logs and had to be reconstructed from the
+    # database. Compression that costs us the ability to read the logs is
+    # not retention, it is data loss with extra steps.
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "10"
+
+  # Container A: The Command Center (MERN Gateway)
+  node-gateway:
+    build:
+      context: ./node-gateway
+      args:
+        SENTINEL_RELEASE_SHA: ${SENTINEL_RELEASE_SHA:-unknown}
+        SENTINEL_BUILD_UTC: ${SENTINEL_BUILD_UTC:-unknown}
+        SENTINEL_SERVICE_NAME: node-gateway
+    container_name: node-gateway
+    restart: unless-stopped
+    mem_limit: 768m
+    cpus: 2
+    expose:
+      - "3000"  # Hidden from the public internet, accessible only to Nginx and Container B
+    volumes:
+      - trading_data:/data
+    environment:
+      - NODE_OPTIONS=--dns-result-order=ipv4first
+    env_file:
+      - ./node-gateway/.env
+    networks:
+      - sentinel-net
+    labels:
+      - autoheal=true  # image HEALTHCHECK: wget /api/health
+    # [ROADMAP-2.8 2026-07-12] 10m x 3 kept ~a day of forensics; the
+    # 2026-07-09 postmortem already hit deleted evidence. 20m x 10
+    # stretches retention for ~40M real disk per container (host disk is
+    # 86% full -- caps stay modest).
+    #
+    # [LOG-READABILITY 2026-07-31] compress:"true" REMOVED. Gzipped rotated
+    # files made `docker logs` silently truncate: the engine returned 254k
+    # lines with no flags but only 13k with --tail 5000000, and --tail 20
+    # could reach lines neither of the others could. node-gateway was
+    # readable only ~5000 lines back. The whole of Tue 2026-07-28 was
+    # unrecoverable from the logs and had to be reconstructed from the
+    # database. Compression that costs us the ability to read the logs is
+    # not retention, it is data loss with extra steps.
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "10"
+
+  # Container B: The Quant Engine (Python Math)
+  python-engine:
+    build:
+      context: ./python-engine
+      args:
+        SENTINEL_RELEASE_SHA: ${SENTINEL_RELEASE_SHA:-unknown}
+        SENTINEL_BUILD_UTC: ${SENTINEL_BUILD_UTC:-unknown}
+        SENTINEL_SERVICE_NAME: python-engine
+    container_name: python-engine
+    restart: unless-stopped
+    # Largest cap: pandas scans over the 500-ticker universe spike well
+    # above the ~160M steady state. 3g is still 1/5 of the host.
+    mem_limit: 3g
+    cpus: 6
+    environment:
+      - TZ=Asia/Kolkata
+      # Partner manual advice is the live advisory-only surface.  The hedge
+      # parent switch also permits Phase-2/3 SHADOW collection; the advanced
+      # delivery switches stay explicitly false until their evidence gates pass.
+      - PARTNER_MANUAL_ADVISORY_ENABLED=${PARTNER_MANUAL_ADVISORY_ENABLED:-true}
+      - PARTNER_MANUAL_ADVISORY_SHADOW_ENABLED=${PARTNER_MANUAL_ADVISORY_SHADOW_ENABLED:-true}
+      - PARTNER_MANUAL_ADVISORY_DELIVERY_ENABLED=${PARTNER_MANUAL_ADVISORY_DELIVERY_ENABLED:-true}
+      - PARTNER_HEDGE_ENABLED=${PARTNER_HEDGE_ENABLED:-true}
+      - PARTNER_HEDGE_PHASE2_ENABLED=${PARTNER_HEDGE_PHASE2_ENABLED:-false}
+      - PARTNER_HEDGE_PHASE2_SHADOW_ENABLED=${PARTNER_HEDGE_PHASE2_SHADOW_ENABLED:-true}
+      - PARTNER_HEDGE_PHASE3_ENABLED=${PARTNER_HEDGE_PHASE3_ENABLED:-false}
+      - PARTNER_HEDGE_PHASE3_SHADOW_ENABLED=${PARTNER_HEDGE_PHASE3_SHADOW_ENABLED:-true}
+      - PROACTIVE_SHADOW_ENABLED=${PROACTIVE_SHADOW_ENABLED:-true}
+    env_file:
+      - ./.env
+    volumes:
+      - trading_data:/data
+    expose:
+      - "8000" # Hidden from the public internet, accessible only to Container A
+    depends_on:
+      - node-gateway
+    networks:
+      - sentinel-net
+    labels:
+      - autoheal=true  # image HEALTHCHECK: curl /health
+    # [ROADMAP-2.8 2026-07-12] 10m x 3 kept ~a day of forensics; the
+    # 2026-07-09 postmortem already hit deleted evidence. 20m x 10
+    # stretches retention for ~40M real disk per container (host disk is
+    # 86% full -- caps stay modest).
+    #
+    # [LOG-READABILITY 2026-07-31] compress:"true" REMOVED. Gzipped rotated
+    # files made `docker logs` silently truncate: the engine returned 254k
+    # lines with no flags but only 13k with --tail 5000000, and --tail 20
+    # could reach lines neither of the others could. node-gateway was
+    # readable only ~5000 lines back. The whole of Tue 2026-07-28 was
+    # unrecoverable from the logs and had to be reconstructed from the
+    # database. Compression that costs us the ability to read the logs is
+    # not retention, it is data loss with extra steps.
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "10"
+
+  # Container C: The Reasoning Engine (Placeholder for now)
+  agent:
+    build:
+      context: ./agent
+      args:
+        SENTINEL_RELEASE_SHA: ${SENTINEL_RELEASE_SHA:-unknown}
+        SENTINEL_BUILD_UTC: ${SENTINEL_BUILD_UTC:-unknown}
+        SENTINEL_SERVICE_NAME: agent
+    container_name: agent
+    restart: unless-stopped
+    mem_limit: 768m
+    cpus: 2
+    environment:
+      # [MINIMAX-MIGRATION 2026-07-15] Reasoning gate now on MiniMax's
+      # OpenAI-compatible API. BASE_URL/MODEL have code defaults; set them in
+      # .env only to override (e.g. mainland endpoint or a different model).
+      - MINIMAX_API_KEY=${MINIMAX_API_KEY}
+      - MINIMAX_BASE_URL=${MINIMAX_BASE_URL:-https://api.minimax.io/v1}
+      - MINIMAX_MODEL=${MINIMAX_MODEL:-MiniMax-M3}
+      # These are bounded annotations/observability, not order authority.
+      # Keep the AI unavailable/reject policies non-blocking while async review
+      # is enabled; agent.py rejects unsafe combinations at runtime.
+      - MINIMAX_ASYNC_REVIEW_ENABLED=${MINIMAX_ASYNC_REVIEW_ENABLED:-true}
+      - MINIMAX_UNAVAILABLE_POLICY=${MINIMAX_UNAVAILABLE_POLICY:-proceed}
+      - MOMENTUM_MINIMAX_REJECT_POLICY=${MOMENTUM_MINIMAX_REJECT_POLICY:-advisory}
+      - ENABLE_NEWS_CLASSIFIER=${ENABLE_NEWS_CLASSIFIER:-1}
+      - DISABLE_CLASSIFIER=${DISABLE_CLASSIFIER:-0}
+      - OPTIONAL_AI_REPORT_USEFULNESS=${OPTIONAL_AI_REPORT_USEFULNESS:-true}
+      - TZ=Asia/Kolkata
+    env_file:
+      - ./.env
+    volumes:
+      # [ROADMAP-2.4 2026-07-12] Read-only: the agent only reads
+      # scheduler_tick.json for the engine freeze watchdog. Its own
+      # heartbeat lives in /tmp (container-local, no volume perms).
+      - trading_data:/data:ro
+    networks:
+      - sentinel-net
+    labels:
+      - autoheal=true  # image HEALTHCHECK: /tmp/agent_heartbeat mtime
+    # [ROADMAP-2.8 2026-07-12] 10m x 3 kept ~a day of forensics; the
+    # 2026-07-09 postmortem already hit deleted evidence. 20m x 10
+    # stretches retention for ~40M real disk per container (host disk is
+    # 86% full -- caps stay modest).
+    #
+    # [LOG-READABILITY 2026-07-31] compress:"true" REMOVED. Gzipped rotated
+    # files made `docker logs` silently truncate: the engine returned 254k
+    # lines with no flags but only 13k with --tail 5000000, and --tail 20
+    # could reach lines neither of the others could. node-gateway was
+    # readable only ~5000 lines back. The whole of Tue 2026-07-28 was
+    # unrecoverable from the logs and had to be reconstructed from the
+    # database. Compression that costs us the ability to read the logs is
+    # not retention, it is data loss with extra steps.
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "10"
+
+  # Public link — replaces the manual `ngrok http --url=... 80`. Starts
+  # with the stack (restart: always), tunnels straight to nginx over the
+  # compose network. Inspector on host :4041 (:4040 is the dietician app's).
+  ngrok:
+    image: ngrok/ngrok:latest
+    container_name: quant_ngrok
+    restart: always
+    mem_limit: 64m
+    cpus: 0.25
+    environment:
+      NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN:?set NGROK_AUTHTOKEN in .env}
+    command: http nginx:80 --url=${NGROK_URL:-outfield-arena-hunk.ngrok-free.dev}
+    ports:
+      - "4041:4040"
+    networks:
+      - sentinel-net
+    depends_on:
+      - nginx
+
+  # [ROADMAP-2.2 2026-07-12] Restarts any container labelled
+  # autoheal=true when its healthcheck turns unhealthy. Needs the docker
+  # socket; no network (it only talks to the local daemon).
+  autoheal:
+    image: willfarrell/autoheal:1.2.0
+    container_name: autoheal
+    restart: always
+    mem_limit: 64m
+    cpus: 0.25
+    environment:
+      - AUTOHEAL_CONTAINER_LABEL=autoheal
+      - AUTOHEAL_INTERVAL=30
+      - AUTOHEAL_START_PERIOD=60
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    network_mode: none
+    # [ROADMAP-2.8 2026-07-12] 10m x 3 kept ~a day of forensics; the
+    # 2026-07-09 postmortem already hit deleted evidence. 20m x 10
+    # stretches retention for ~40M real disk per container (host disk is
+    # 86% full -- caps stay modest).
+    #
+    # [LOG-READABILITY 2026-07-31] compress:"true" REMOVED. Gzipped rotated
+    # files made `docker logs` silently truncate: the engine returned 254k
+    # lines with no flags but only 13k with --tail 5000000, and --tail 20
+    # could reach lines neither of the others could. node-gateway was
+    # readable only ~5000 lines back. The whole of Tue 2026-07-28 was
+    # unrecoverable from the logs and had to be reconstructed from the
+    # database. Compression that costs us the ability to read the logs is
+    # not retention, it is data loss with extra steps.
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "10"
+
+networks:
+  sentinel-net:
+    driver: bridge
+
+volumes:
+  trading_data:
+    driver: local
